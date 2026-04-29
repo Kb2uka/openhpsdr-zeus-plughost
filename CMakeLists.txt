@@ -34,6 +34,7 @@ set(ZEUS_PLUGHOST_SOURCES
     src/ipc/control_pipe.cpp
     src/audio/passthrough.cpp
     src/vst3/plugin_host.cpp
+    src/vst3/plugin_chain.cpp
     # Platform-specific Module loader from the VST 3 SDK. Defined by
     # cmake/deps.cmake based on the host triple; we compile it directly
     # into our binary so the SDK's example target tree stays disabled.

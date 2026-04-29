@@ -25,7 +25,7 @@
 #include "audio/block_format.h"
 #include "ipc/shm_ring.h"
 #include "ipc/wakeup.h"
-#include "vst3/plugin_host.h"
+#include "vst3/plugin_chain.h"
 
 namespace zeus::plughost {
 
@@ -36,7 +36,7 @@ void RunPassthrough(ShmRing&                 inputRing,
                     PassthroughStats&        stats,
                     const volatile bool&     stopFlag,
                     const std::atomic<bool>& controlStopFlag,
-                    vst3::PluginHost*        pluginHost) {
+                    vst3::PluginChain*       pluginChain) {
     while (!stopFlag && !controlStopFlag.load(std::memory_order_relaxed)) {
         // Block on the input wakeup with a short timeout so we can poll
         // the stop flags. The host posts this semaphore once per block.
@@ -76,21 +76,15 @@ void RunPassthrough(ShmRing&                 inputRing,
             const float* inPayload  = PayloadOf(in);
             float*       outPayload = PayloadOf(out);
 
-            // Plugin dispatch — single mono channel only in Phase 2.
-            // PluginHost::Process is realtime-safe (atomic acquire load
-            // on the active slot, then a single processor->process()
-            // call). When no plugin is loaded, IsLoaded() returns false
-            // without any acquire-release cost beyond a relaxed atomic
-            // read, and we fall through to the memcpy path.
-            bool processed = false;
-            if (pluginHost != nullptr
-                && in->channels == 1
-                && pluginHost->IsLoaded()) {
-                processed = pluginHost->Process(
+            // Plugin dispatch — single mono channel only in Phase 2/3a.
+            // PluginChain::Process is realtime-safe and itself owns the
+            // master-disabled / all-empty fast path (single memcpy). It
+            // runs allocation-free / lock-free / syscall-free.
+            if (pluginChain != nullptr && in->channels == 1) {
+                pluginChain->Process(
                     inPayload, outPayload,
                     static_cast<std::int32_t>(in->frames));
-            }
-            if (!processed) {
+            } else {
                 std::memcpy(outPayload, inPayload, bytes);
             }
 

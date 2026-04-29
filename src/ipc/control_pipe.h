@@ -18,7 +18,19 @@
 //   0x12 UnloadPlugin       host -> sidecar (no payload)
 //   0x13 UnloadPluginResult sidecar -> host (status u8)
 //
-// Parameter-change messages are Phase 3+.
+// Slot-aware chain ops (Phase 3a):
+//   0x14 SlotLoadPlugin     host -> sidecar (u8 slot + u32 pathLen + UTF-8)
+//   0x15 SlotLoadPluginResult
+//   0x16 SlotUnloadPlugin
+//   0x17 SlotUnloadPluginResult
+//   0x18 SlotSetBypass
+//   0x19 SlotSetBypassResult
+//   0x1A SetChainEnabled
+//   0x1B SetChainEnabledResult
+//   0x20 SlotListParams
+//   0x21 SlotParamListResult
+//   0x22 SlotSetParam
+//   0x23 SlotSetParamResult
 
 #pragma once
 
@@ -30,15 +42,27 @@
 namespace zeus::plughost {
 
 enum class ControlMessageTag : std::uint8_t {
-    Hello              = 0x01,
-    HelloAck           = 0x02,
-    Heartbeat          = 0x03,
-    Goodbye            = 0x04,
-    LogLine            = 0x05,
-    LoadPlugin         = 0x10,
-    LoadPluginResult   = 0x11,
-    UnloadPlugin       = 0x12,
-    UnloadPluginResult = 0x13,
+    Hello                   = 0x01,
+    HelloAck                = 0x02,
+    Heartbeat               = 0x03,
+    Goodbye                 = 0x04,
+    LogLine                 = 0x05,
+    LoadPlugin              = 0x10,
+    LoadPluginResult        = 0x11,
+    UnloadPlugin            = 0x12,
+    UnloadPluginResult      = 0x13,
+    SlotLoadPlugin          = 0x14,
+    SlotLoadPluginResult    = 0x15,
+    SlotUnloadPlugin        = 0x16,
+    SlotUnloadPluginResult  = 0x17,
+    SlotSetBypass           = 0x18,
+    SlotSetBypassResult     = 0x19,
+    SetChainEnabled         = 0x1A,
+    SetChainEnabledResult   = 0x1B,
+    SlotListParams          = 0x20,
+    SlotParamListResult     = 0x21,
+    SlotSetParam            = 0x22,
+    SlotSetParamResult      = 0x23,
 };
 
 class ControlPipe {

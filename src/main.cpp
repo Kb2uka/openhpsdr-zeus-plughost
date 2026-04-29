@@ -33,6 +33,7 @@
 #include "ipc/control_pipe.h"
 #include "ipc/shm_ring.h"
 #include "ipc/wakeup.h"
+#include "vst3/plugin_chain.h"
 #include "vst3/plugin_host.h"
 
 namespace {
@@ -214,12 +215,77 @@ int main(int argc, char** argv) {
             "zeus-plughost: handshake OK (proto=%u rate=%u frames=%u ch=%u)\n",
             protoVer, sampleRate, framesPerBlock, channels);
 
-        // Single-slot VST3 plugin host. Constructed before the audio
-        // loop; the audio thread peeks via atomic<ActivePlugin*>, control
-        // thread mutates via Load/Unload calls.
-        vst3::PluginHost pluginHost;
+        // 8-slot serial plugin chain (Phase 3a). Master enable defaults
+        // to OFF — the chain is bit-identical pass-through until the host
+        // explicitly turns it on. Slot 0 alone preserves the Phase 2
+        // single-slot wire (LoadPlugin / UnloadPlugin).
+        vst3::PluginChain pluginChain(
+            static_cast<double>(kPhase1SampleRate),
+            static_cast<std::int32_t>(kPhase1Frames));
 
-        // Helper: encode + send a LoadPluginResult control message.
+        // ---- helpers: little-endian byte appenders ----
+        auto appendU8 = [](std::vector<std::uint8_t>& body, std::uint8_t v) {
+            body.push_back(v);
+        };
+        auto appendU32Le = [](std::vector<std::uint8_t>& body, std::uint32_t v) {
+            body.push_back(static_cast<std::uint8_t>(v & 0xFFu));
+            body.push_back(static_cast<std::uint8_t>((v >> 8) & 0xFFu));
+            body.push_back(static_cast<std::uint8_t>((v >> 16) & 0xFFu));
+            body.push_back(static_cast<std::uint8_t>((v >> 24) & 0xFFu));
+        };
+        auto appendI32Le = [&](std::vector<std::uint8_t>& body, std::int32_t v) {
+            appendU32Le(body, static_cast<std::uint32_t>(v));
+        };
+        auto appendF64Le = [](std::vector<std::uint8_t>& body, double v) {
+            std::uint64_t bits = 0;
+            std::memcpy(&bits, &v, sizeof(bits));
+            for (int i = 0; i < 8; ++i) {
+                body.push_back(static_cast<std::uint8_t>(
+                    (bits >> (i * 8)) & 0xFFu));
+            }
+        };
+        auto appendString = [&](std::vector<std::uint8_t>& body,
+                                const std::string& s) {
+            appendU32Le(body, static_cast<std::uint32_t>(s.size()));
+            body.insert(body.end(), s.begin(), s.end());
+        };
+
+        // ---- helpers: little-endian payload decoders ----
+        auto readU32Le = [](const std::vector<std::uint8_t>& p, std::size_t off) {
+            return static_cast<std::uint32_t>(p[off])
+                 | (static_cast<std::uint32_t>(p[off + 1]) << 8)
+                 | (static_cast<std::uint32_t>(p[off + 2]) << 16)
+                 | (static_cast<std::uint32_t>(p[off + 3]) << 24);
+        };
+        auto readF64Le = [](const std::vector<std::uint8_t>& p, std::size_t off) {
+            std::uint64_t bits = 0;
+            for (int i = 0; i < 8; ++i) {
+                bits |= static_cast<std::uint64_t>(p[off + i]) << (i * 8);
+            }
+            double v = 0;
+            std::memcpy(&v, &bits, sizeof(v));
+            return v;
+        };
+
+        // ---- send helpers (each composes a payload + ships it) ----
+        auto buildLoadResultBody =
+            [&](std::uint8_t status,
+                const std::string& name,
+                const std::string& vendor,
+                const std::string& version,
+                const std::string& errorMessage,
+                std::vector<std::uint8_t>& body) {
+            body.clear();
+            body.push_back(status);
+            if (status == 0) {
+                appendString(body, name);
+                appendString(body, vendor);
+                appendString(body, version);
+            } else {
+                appendString(body, errorMessage);
+            }
+        };
+
         auto sendLoadResult =
             [&](std::uint8_t status,
                 const std::string& name,
@@ -229,24 +295,7 @@ int main(int argc, char** argv) {
             std::vector<std::uint8_t> body;
             body.reserve(64 + name.size() + vendor.size()
                               + version.size() + errorMessage.size());
-            body.push_back(status);
-            auto appendU32Le = [&](std::uint32_t v) {
-                body.push_back(static_cast<std::uint8_t>(v & 0xFFu));
-                body.push_back(static_cast<std::uint8_t>((v >> 8) & 0xFFu));
-                body.push_back(static_cast<std::uint8_t>((v >> 16) & 0xFFu));
-                body.push_back(static_cast<std::uint8_t>((v >> 24) & 0xFFu));
-            };
-            auto appendString = [&](const std::string& s) {
-                appendU32Le(static_cast<std::uint32_t>(s.size()));
-                body.insert(body.end(), s.begin(), s.end());
-            };
-            if (status == 0) {
-                appendString(name);
-                appendString(vendor);
-                appendString(version);
-            } else {
-                appendString(errorMessage);
-            }
+            buildLoadResultBody(status, name, vendor, version, errorMessage, body);
             control.Send(ControlMessageTag::LoadPluginResult,
                          body.data(), body.size());
         };
@@ -254,6 +303,79 @@ int main(int argc, char** argv) {
         auto sendUnloadResult = [&](std::uint8_t status) {
             std::uint8_t one = status;
             control.Send(ControlMessageTag::UnloadPluginResult, &one, 1);
+        };
+
+        auto sendSlotLoadResult =
+            [&](std::uint8_t slot,
+                std::uint8_t status,
+                const std::string& name,
+                const std::string& vendor,
+                const std::string& version,
+                const std::string& errorMessage) {
+            std::vector<std::uint8_t> body;
+            body.reserve(64 + name.size() + vendor.size()
+                              + version.size() + errorMessage.size());
+            body.push_back(slot);
+            body.push_back(status);
+            if (status == 0) {
+                appendString(body, name);
+                appendString(body, vendor);
+                appendString(body, version);
+            } else {
+                appendString(body, errorMessage);
+            }
+            control.Send(ControlMessageTag::SlotLoadPluginResult,
+                         body.data(), body.size());
+        };
+
+        auto sendSlotUnloadResult = [&](std::uint8_t slot, std::uint8_t status) {
+            std::uint8_t buf[2] = { slot, status };
+            control.Send(ControlMessageTag::SlotUnloadPluginResult, buf, 2);
+        };
+
+        auto sendSlotBypassResult = [&](std::uint8_t slot, std::uint8_t status) {
+            std::uint8_t buf[2] = { slot, status };
+            control.Send(ControlMessageTag::SlotSetBypassResult, buf, 2);
+        };
+
+        auto sendChainEnabledResult = [&](std::uint8_t status) {
+            std::uint8_t one = status;
+            control.Send(ControlMessageTag::SetChainEnabledResult, &one, 1);
+        };
+
+        auto sendSlotParamListResult =
+            [&](std::uint8_t slot, std::uint8_t status,
+                const std::vector<vst3::ParamInfo>& params) {
+            std::vector<std::uint8_t> body;
+            body.push_back(slot);
+            body.push_back(status);
+            if (status == 0) {
+                appendU32Le(body, static_cast<std::uint32_t>(params.size()));
+                for (const auto& p : params) {
+                    appendU32Le(body, p.id);
+                    appendString(body, p.name);
+                    appendString(body, p.units);
+                    appendF64Le(body, p.defaultValue);
+                    appendF64Le(body, p.currentValue);
+                    appendI32Le(body, p.stepCount);
+                    appendU8(body, p.flags);
+                }
+            }
+            control.Send(ControlMessageTag::SlotParamListResult,
+                         body.data(), body.size());
+        };
+
+        auto sendSlotSetParamResult =
+            [&](std::uint8_t slot, std::uint32_t paramId,
+                std::uint8_t status, double actual) {
+            std::vector<std::uint8_t> body;
+            body.reserve(14);
+            body.push_back(slot);
+            appendU32Le(body, paramId);
+            body.push_back(status);
+            appendF64Le(body, actual);
+            control.Send(ControlMessageTag::SlotSetParamResult,
+                         body.data(), body.size());
         };
 
         // 5. Background control-read thread. Reads Goodbye / Heartbeat /
@@ -281,16 +403,12 @@ int main(int argc, char** argv) {
                     return;
                 }
                 if (t == ControlMessageTag::LoadPlugin) {
-                    // Payload: u32 pathLen LE + UTF-8 bytes.
+                    // Backwards-compat: 0x10 LoadPlugin == slot-0 SlotLoadPlugin.
                     if (p.size() < 4) {
                         sendLoadResult(5, {}, {}, {}, "LoadPlugin payload truncated");
                         continue;
                     }
-                    std::uint32_t pathLen =
-                        static_cast<std::uint32_t>(p[0])
-                        | (static_cast<std::uint32_t>(p[1]) << 8)
-                        | (static_cast<std::uint32_t>(p[2]) << 16)
-                        | (static_cast<std::uint32_t>(p[3]) << 24);
+                    std::uint32_t pathLen = readU32Le(p, 0);
                     if (p.size() != 4u + pathLen) {
                         sendLoadResult(5, {}, {}, {},
                             "LoadPlugin payload size mismatch");
@@ -298,21 +416,18 @@ int main(int argc, char** argv) {
                     }
                     std::string path(reinterpret_cast<const char*>(p.data() + 4),
                                      pathLen);
-                    auto result = pluginHost.Load(
-                        path,
-                        static_cast<double>(kPhase1SampleRate),
-                        static_cast<std::int32_t>(kPhase1Frames));
+                    auto result = pluginChain.LoadSlot(0, path);
                     if (auto* info = std::get_if<vst3::LoadInfo>(&result)) {
                         std::fprintf(stderr,
-                            "zeus-plughost: loaded plugin name='%s' vendor='%s' "
-                            "version='%s'\n",
+                            "zeus-plughost: slot=0 loaded plugin name='%s' "
+                            "vendor='%s' version='%s'\n",
                             info->name.c_str(), info->vendor.c_str(),
                             info->version.c_str());
                         sendLoadResult(0, info->name, info->vendor, info->version, {});
                     } else {
                         const auto& err = std::get<vst3::LoadError>(result);
                         std::fprintf(stderr,
-                            "zeus-plughost: load failed status=%u msg='%s'\n",
+                            "zeus-plughost: slot=0 load failed status=%u msg='%s'\n",
                             static_cast<unsigned>(err.status),
                             err.message.c_str());
                         sendLoadResult(err.status, {}, {}, {}, err.message);
@@ -320,12 +435,104 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 if (t == ControlMessageTag::UnloadPlugin) {
-                    bool wasLoaded = pluginHost.IsLoaded();
-                    pluginHost.Unload();
-                    sendUnloadResult(wasLoaded ? 0u : 1u);
+                    // Backwards-compat: 0x12 == slot-0 SlotUnloadPlugin.
+                    std::uint8_t st = pluginChain.UnloadSlot(0);
+                    sendUnloadResult(st);
                     continue;
                 }
-                // Heartbeat or anything else: ignore silently in Phase 2.
+                if (t == ControlMessageTag::SlotLoadPlugin) {
+                    // Payload: u8 slot + u32 pathLen + UTF-8 path.
+                    if (p.size() < 5) {
+                        sendSlotLoadResult(0xFFu, 5, {}, {}, {},
+                            "SlotLoadPlugin payload truncated");
+                        continue;
+                    }
+                    std::uint8_t slot = p[0];
+                    std::uint32_t pathLen = readU32Le(p, 1);
+                    if (p.size() != 5u + pathLen) {
+                        sendSlotLoadResult(slot, 5, {}, {}, {},
+                            "SlotLoadPlugin payload size mismatch");
+                        continue;
+                    }
+                    std::string path(reinterpret_cast<const char*>(p.data() + 5),
+                                     pathLen);
+                    auto result = pluginChain.LoadSlot(static_cast<int>(slot), path);
+                    if (auto* info = std::get_if<vst3::LoadInfo>(&result)) {
+                        std::fprintf(stderr,
+                            "zeus-plughost: slot=%u loaded plugin name='%s'\n",
+                            slot, info->name.c_str());
+                        sendSlotLoadResult(slot, 0,
+                            info->name, info->vendor, info->version, {});
+                    } else {
+                        const auto& err = std::get<vst3::LoadError>(result);
+                        std::fprintf(stderr,
+                            "zeus-plughost: slot=%u load failed status=%u msg='%s'\n",
+                            slot, static_cast<unsigned>(err.status),
+                            err.message.c_str());
+                        sendSlotLoadResult(slot, err.status, {}, {}, {}, err.message);
+                    }
+                    continue;
+                }
+                if (t == ControlMessageTag::SlotUnloadPlugin) {
+                    if (p.size() != 1) {
+                        sendSlotUnloadResult(0xFFu, 5);
+                        continue;
+                    }
+                    std::uint8_t slot = p[0];
+                    std::uint8_t st = pluginChain.UnloadSlot(static_cast<int>(slot));
+                    sendSlotUnloadResult(slot, st);
+                    continue;
+                }
+                if (t == ControlMessageTag::SlotSetBypass) {
+                    if (p.size() != 2) {
+                        sendSlotBypassResult(0xFFu, 5);
+                        continue;
+                    }
+                    std::uint8_t slot = p[0];
+                    bool bypass = (p[1] != 0);
+                    std::uint8_t st = pluginChain.SetSlotBypass(
+                        static_cast<int>(slot), bypass);
+                    sendSlotBypassResult(slot, st);
+                    continue;
+                }
+                if (t == ControlMessageTag::SetChainEnabled) {
+                    if (p.size() != 1) {
+                        sendChainEnabledResult(5);
+                        continue;
+                    }
+                    bool enabled = (p[0] != 0);
+                    pluginChain.SetChainEnabled(enabled);
+                    sendChainEnabledResult(0);
+                    continue;
+                }
+                if (t == ControlMessageTag::SlotListParams) {
+                    if (p.size() != 1) {
+                        sendSlotParamListResult(0xFFu, 5, {});
+                        continue;
+                    }
+                    std::uint8_t slot = p[0];
+                    std::vector<vst3::ParamInfo> params;
+                    std::uint8_t st = pluginChain.ListParams(
+                        static_cast<int>(slot), params);
+                    sendSlotParamListResult(slot, st, params);
+                    continue;
+                }
+                if (t == ControlMessageTag::SlotSetParam) {
+                    // Payload: u8 slot + u32 paramId + f64 normalized = 13 bytes.
+                    if (p.size() != 13) {
+                        sendSlotSetParamResult(0xFFu, 0, 5, 0.0);
+                        continue;
+                    }
+                    std::uint8_t slot = p[0];
+                    std::uint32_t paramId = readU32Le(p, 1);
+                    double normalized = readF64Le(p, 5);
+                    double actual = 0.0;
+                    std::uint8_t st = pluginChain.SetParam(
+                        static_cast<int>(slot), paramId, normalized, actual);
+                    sendSlotSetParamResult(slot, paramId, st, actual);
+                    continue;
+                }
+                // Heartbeat or anything else: ignore silently.
             }
         });
 
@@ -361,7 +568,7 @@ int main(int argc, char** argv) {
                        stats,
                        g_stopFlag,
                        stopFromControl,
-                       &pluginHost);
+                       &pluginChain);
 
         if (heartbeat.joinable())     heartbeat.join();
         if (controlReader.joinable()) controlReader.join();

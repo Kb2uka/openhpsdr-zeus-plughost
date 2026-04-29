@@ -1,6 +1,6 @@
 // plugin_host.h — single-slot VST 3 plugin host.
 //
-// Phase 2 contract:
+// Phase 2/3a contract:
 //
 //   - One PluginHost owns at most one loaded plugin instance.
 //   - Load() is called from the control thread (slow first-load is OK).
@@ -10,10 +10,19 @@
 //     std::atomic with memory_order_acquire; control-thread writes use
 //     memory_order_release. When IsLoaded() returns false, Process() is
 //     a no-op (the audio loop falls back to its existing memcpy path).
+//   - ListParams() / SetParam() walk the IEditController; both run on
+//     the control thread and may take the controlMutex (which serialises
+//     against Load/Unload).
 //
 // Phase 2 simplifications: mono in / mono out, sample size 32-bit float,
 // fixed buffer geometry (caller passes sampleRate / maxBlockSize at Load
-// time), no parameter automation, no presets, no GUI.
+// time), no presets, no GUI.
+//
+// Phase 3a addition: parameter introspection via IEditController. Many
+// plugins use a single-component class for both IComponent and
+// IEditController; others expose a separate controller class via
+// IComponent::getControllerClassId(). Both shapes are handled inside
+// PluginHost::Load().
 //
 // Cross-platform shape: Module loading flows through the SDK's
 // VST3::Hosting::Module facade; the platform-specific module_*.cpp file
@@ -25,8 +34,23 @@
 #include <cstdint>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace zeus::plughost::vst3 {
+
+// Snapshot of one VST3 parameter, copied from the plugin's
+// IEditController via getParameterInfo + getParamNormalized. All fields
+// are owned by value (no SDK refcounts leak through this struct).
+struct ParamInfo {
+    std::uint32_t id;            // VST3 ParamID, opaque to host
+    std::string   name;          // UTF-8, from ParameterInfo::title
+    std::string   units;         // UTF-8, from ParameterInfo::units
+    double        defaultValue;  // normalized 0..1
+    double        currentValue;  // normalized 0..1 (snapshot)
+    std::int32_t  stepCount;     // 0 = continuous, >0 = stepped
+    std::uint8_t  flags;         // bit0 readonly, bit1 automatable,
+                                 // bit2 hidden, bit3 list
+};
 
 // Successful load — name / vendor / version come from the module's class
 // info plus the factory info.
@@ -92,6 +116,26 @@ public:
     // Optional: snapshot of the most recent load info for diagnostics.
     // Returned by value to avoid races with concurrent Load/Unload.
     LoadInfo CurrentInfo() const;
+
+    // Phase 3a: parameter introspection. Returns an empty list if no
+    // plugin is loaded, no controller is available, or the controller
+    // reports zero parameters. Called from the control thread only.
+    std::vector<ParamInfo> ListParams();
+
+    // Phase 3a: set one parameter, normalized 0..1. Returns the value
+    // the plugin reports back via getParamNormalized after the set
+    // (some plugins quantise / clamp). Returns NaN on error (no plugin
+    // loaded, no controller, paramId not found). Called from the
+    // control thread only.
+    //
+    // Threading note: VST3 strictly recommends parameter changes be
+    // delivered through ProcessData::inputParameterChanges on the audio
+    // thread. We bypass that and call setParamNormalized directly from
+    // the control thread, which most simple hosts do for non-realtime
+    // parameter tweaks. The plugin's controller must be reentrant with
+    // respect to its audio-thread IComponent — that is the standard
+    // VST3 contract for the controller object.
+    double SetParam(std::uint32_t paramId, double normalized);
 
 private:
     struct Impl;

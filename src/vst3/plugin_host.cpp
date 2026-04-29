@@ -32,6 +32,7 @@
 #include "vst3/sdk_includes.h"
 
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -49,9 +50,15 @@ using Steinberg::IPtr;
 using Steinberg::kResultOk;
 using Steinberg::kResultTrue;
 using Steinberg::tresult;
+using Steinberg::TUID;
+using Steinberg::FUID;
 using Steinberg::Vst::HostApplication;
 using Steinberg::Vst::IAudioProcessor;
 using Steinberg::Vst::IComponent;
+using Steinberg::Vst::IConnectionPoint;
+using Steinberg::Vst::IEditController;
+using Steinberg::Vst::ParameterInfo;
+using Steinberg::Vst::ParamID;
 using Steinberg::Vst::ProcessData;
 using Steinberg::Vst::ProcessSetup;
 using Steinberg::Vst::AudioBusBuffers;
@@ -67,6 +74,10 @@ struct ActivePlugin {
     VST3::Hosting::Module::Ptr module;
     IPtr<IComponent>           component;
     IPtr<IAudioProcessor>      processor;
+    IPtr<IEditController>      controller;     // may be null
+    bool                       singleComponent = false;  // controller == component
+    IPtr<IConnectionPoint>     componentCp;
+    IPtr<IConnectionPoint>     controllerCp;
     LoadInfo                   info;
     std::int32_t               maxBlockSize;
     double                     sampleRate;
@@ -144,6 +155,76 @@ std::unique_ptr<ActivePlugin> InstantiateAndActivate(
         active->processor = Steinberg::owned(rawProc);
     }
 
+    // 3a. Try to obtain the IEditController. Two shapes:
+    //     - Single-component plugin: IComponent IS the controller. We
+    //       just queryInterface on the component pointer.
+    //     - Two-class plugin: IComponent::getControllerClassId returns
+    //       a separate CID; we instantiate that class via the factory
+    //       and call initialize on it.
+    //     Failure to obtain a controller is NOT fatal — the audio path
+    //     still works; ListParams() returns empty.
+    {
+        IEditController* rawCtrl = nullptr;
+        if (active->component->queryInterface(
+                IEditController::iid,
+                reinterpret_cast<void**>(&rawCtrl)) == kResultOk
+            && rawCtrl != nullptr) {
+            // queryInterface returns an AddRef'd pointer; wrap it directly.
+            active->controller      = Steinberg::owned(rawCtrl);
+            active->singleComponent = true;
+        } else {
+            TUID controllerCID;
+            std::memset(controllerCID, 0, sizeof(controllerCID));
+            if (active->component->getControllerClassId(controllerCID) == kResultOk) {
+                FUID cid = FUID::fromTUID(controllerCID);
+                if (cid.isValid()) {
+                    auto& factory = active->module->getFactory();
+                    // PluginFactory::createInstance<T> returns IPtr<T>
+                    // (already owned). Assigning to active->controller
+                    // copies the IPtr, keeping the refcount alive.
+                    active->controller = factory.createInstance<IEditController>(
+                        VST3::UID::fromTUID(controllerCID));
+                    if (active->controller) {
+                        // Initialise the controller; some plugins fail
+                        // here (e.g. need a specific host context) — in
+                        // that case drop the controller and continue.
+                        if (active->controller->initialize(
+                                static_cast<FUnknown*>(hostContext))
+                            != kResultOk) {
+                            active->controller = nullptr;
+                        } else {
+                            active->singleComponent = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3b. If we have a separate controller, connect it to the component
+    //     via IConnectionPoint so they can exchange messages. Many
+    //     plugins ignore this; some require it (state sync). Best-effort.
+    if (active->controller && !active->singleComponent) {
+        IConnectionPoint* rawCompCp = nullptr;
+        IConnectionPoint* rawCtrlCp = nullptr;
+        if (active->component->queryInterface(
+                IConnectionPoint::iid,
+                reinterpret_cast<void**>(&rawCompCp)) == kResultOk
+            && rawCompCp != nullptr) {
+            active->componentCp = Steinberg::owned(rawCompCp);
+        }
+        if (active->controller->queryInterface(
+                IConnectionPoint::iid,
+                reinterpret_cast<void**>(&rawCtrlCp)) == kResultOk
+            && rawCtrlCp != nullptr) {
+            active->controllerCp = Steinberg::owned(rawCtrlCp);
+        }
+        if (active->componentCp && active->controllerCp) {
+            active->componentCp->connect(active->controllerCp);
+            active->controllerCp->connect(active->componentCp);
+        }
+    }
+
     // 4. Best-effort: tell the plugin we want mono in / mono out. Many
     //    plugins enforce a fixed channel count regardless of this; the
     //    test contract is "no crash", so a non-OK return is informational.
@@ -212,6 +293,19 @@ void TearDownActive(ActivePlugin* a) noexcept {
         using Steinberg::Vst::kOutput;
         a->component->activateBus(kAudio, kInput,  0, false);
         a->component->activateBus(kAudio, kOutput, 0, false);
+    }
+    // Disconnect the controller<->component message bus before terminate.
+    if (a->componentCp && a->controllerCp) {
+        a->componentCp->disconnect(a->controllerCp);
+        a->controllerCp->disconnect(a->componentCp);
+    }
+    a->componentCp  = nullptr;
+    a->controllerCp = nullptr;
+    if (a->controller && !a->singleComponent) {
+        a->controller->terminate();
+    }
+    a->controller = nullptr;
+    if (a->component) {
         a->component->terminate();
     }
     a->processor = nullptr;
@@ -407,6 +501,65 @@ bool PluginHost::Process(const float* in, float* out, std::int32_t frames) noexc
         return false;
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Parameter introspection (Phase 3a). Both ListParams and SetParam run on
+// the control thread under controlMutex; they read the active-plugin slot
+// directly because the slot is only mutated from the same thread we run on.
+// ---------------------------------------------------------------------------
+
+std::vector<ParamInfo> PluginHost::ListParams() {
+    std::lock_guard<std::mutex> guard(impl_->controlMutex);
+    std::vector<ParamInfo> out;
+    ActivePlugin* a = impl_->active.load(std::memory_order_acquire);
+    if (a == nullptr || !a->controller) {
+        return out;
+    }
+    const Steinberg::int32 count = a->controller->getParameterCount();
+    if (count <= 0) {
+        return out;
+    }
+    out.reserve(static_cast<std::size_t>(count));
+    for (Steinberg::int32 i = 0; i < count; ++i) {
+        ParameterInfo pi;
+        std::memset(&pi, 0, sizeof(pi));
+        if (a->controller->getParameterInfo(i, pi) != kResultOk) {
+            continue;
+        }
+        ParamInfo info;
+        info.id           = static_cast<std::uint32_t>(pi.id);
+        info.name         = Steinberg::Vst::StringConvert::convert(pi.title);
+        info.units        = Steinberg::Vst::StringConvert::convert(pi.units);
+        info.defaultValue = pi.defaultNormalizedValue;
+        // currentValue: read from the controller. May fail silently for
+        // some plugins; the default is a safe fallback.
+        info.currentValue = a->controller->getParamNormalized(pi.id);
+        info.stepCount    = static_cast<std::int32_t>(pi.stepCount);
+
+        std::uint8_t flags = 0;
+        if ((pi.flags & ParameterInfo::kIsReadOnly)  != 0) flags |= 0x01;
+        if ((pi.flags & ParameterInfo::kCanAutomate) != 0) flags |= 0x02;
+        if ((pi.flags & ParameterInfo::kIsHidden)    != 0) flags |= 0x04;
+        if ((pi.flags & ParameterInfo::kIsList)      != 0) flags |= 0x08;
+        info.flags = flags;
+
+        out.push_back(std::move(info));
+    }
+    return out;
+}
+
+double PluginHost::SetParam(std::uint32_t paramId, double normalized) {
+    std::lock_guard<std::mutex> guard(impl_->controlMutex);
+    ActivePlugin* a = impl_->active.load(std::memory_order_acquire);
+    if (a == nullptr || !a->controller) {
+        return std::nan("");
+    }
+    if (normalized < 0.0) normalized = 0.0;
+    if (normalized > 1.0) normalized = 1.0;
+    a->controller->setParamNormalized(static_cast<ParamID>(paramId), normalized);
+    // Read back what the plugin actually accepted (post quantise / clamp).
+    return a->controller->getParamNormalized(static_cast<ParamID>(paramId));
 }
 
 }  // namespace zeus::plughost::vst3
