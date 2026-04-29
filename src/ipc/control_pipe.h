@@ -6,13 +6,19 @@
 // then 1-byte type, then `length - 1` bytes of payload).
 //
 // Phase 2 message types (see docs/proposals/vst-host-phase2-wire.md):
-//   0x01 Hello      sidecar -> host (16 byte payload)
-//   0x02 HelloAck   host -> sidecar (no payload)
-//   0x03 Heartbeat  bidirectional (optional Phase 2)
-//   0x04 Goodbye    host -> sidecar (no payload)
-//   0x05 LogLine    sidecar -> host (UTF-8 bytes)
+//   0x01 Hello              sidecar -> host (16 byte payload)
+//   0x02 HelloAck           host -> sidecar (no payload)
+//   0x03 Heartbeat          bidirectional (optional Phase 2)
+//   0x04 Goodbye            host -> sidecar (no payload)
+//   0x05 LogLine            sidecar -> host (UTF-8 bytes)
 //
-// Plugin-load + parameter-change messages are Phase 3+.
+// Plugin lifecycle (Phase 2 real):
+//   0x10 LoadPlugin         host -> sidecar (u32 pathLen + UTF-8 path)
+//   0x11 LoadPluginResult   sidecar -> host (status u8 + name/vendor/version | error)
+//   0x12 UnloadPlugin       host -> sidecar (no payload)
+//   0x13 UnloadPluginResult sidecar -> host (status u8)
+//
+// Parameter-change messages are Phase 3+.
 
 #pragma once
 
@@ -24,11 +30,15 @@
 namespace zeus::plughost {
 
 enum class ControlMessageTag : std::uint8_t {
-    Hello     = 0x01,
-    HelloAck  = 0x02,
-    Heartbeat = 0x03,
-    Goodbye   = 0x04,
-    LogLine   = 0x05,
+    Hello              = 0x01,
+    HelloAck           = 0x02,
+    Heartbeat          = 0x03,
+    Goodbye            = 0x04,
+    LogLine            = 0x05,
+    LoadPlugin         = 0x10,
+    LoadPluginResult   = 0x11,
+    UnloadPlugin       = 0x12,
+    UnloadPluginResult = 0x13,
 };
 
 class ControlPipe {

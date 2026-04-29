@@ -1,51 +1,56 @@
-# deps.cmake — third-party dependency stubs.
+# deps.cmake — third-party dependency wiring.
 #
-# Phase 1 (current):
-#   We are NOT loading any plugins yet. The data-plane skeleton is a pure
-#   pass-through smoke test. No vendor SDKs are required to build.
+# Phase 2 (current):
+#   We bring in the Steinberg VST 3 SDK as a git submodule under
+#   third_party/vst3sdk/. The SDK exposes three static-library targets we
+#   actually want to link (sdk_hosting, base, pluginterfaces); everything
+#   else (examples, validator, VSTGUI, plugin-link helpers) is force-OFF
+#   here BEFORE add_subdirectory() so the SDK does not produce surplus
+#   artefacts in our build tree.
 #
-# Phase 2 (TODO):
-#   Re-enable the FetchContent_Declare blocks below and check the resulting
-#   trees into third_party/ as submodules.
+# Phase 3+ (TODO):
+#   - clap : https://github.com/free-audio/clap          (MIT)
+#   - vestige : VST2 header (LGPL) under third_party/vestige/
 #
-#     - vst3sdk : https://github.com/steinbergmedia/vst3sdk         (MIT)
-#     - clap    : https://github.com/free-audio/clap                (MIT)
-#     - vestige : VST2 header (LGPL) — kept under third_party/vestige/
-#     - tinycbor: https://github.com/intel/tinycbor                 (MIT)
-#                 for control-plane CBOR framing.
+# Pinned version + commit SHA: see third_party/vst3sdk_PINNED_VERSION.md.
 
-include(FetchContent)
+# ---- VST 3 SDK -------------------------------------------------------------
 
-option(ZEUS_PLUGHOST_FETCH_DEPS
-    "Fetch vst3sdk / CLAP / vestige via FetchContent (Phase 2 only)" OFF)
+set(SMTG_ENABLE_VST3_PLUGIN_EXAMPLES  OFF CACHE BOOL "" FORCE)
+set(SMTG_ENABLE_VST3_HOSTING_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(SMTG_ENABLE_VSTGUI_SUPPORT        OFF CACHE BOOL "" FORCE)
+set(SMTG_RUN_VST_VALIDATOR            OFF CACHE BOOL "" FORCE)
+set(SMTG_CREATE_PLUGIN_LINK           OFF CACHE BOOL "" FORCE)
+set(SMTG_ENABLE_WAYLAND_SUPPORT       OFF CACHE BOOL "" FORCE)
 
-if(ZEUS_PLUGHOST_FETCH_DEPS)
-    message(WARNING
-        "ZEUS_PLUGHOST_FETCH_DEPS is ON, but Phase 1 has no plugin loading. "
-        "Ignoring; flip this back ON in Phase 2.")
+set(_zeus_vst3sdk_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vst3sdk")
+if(NOT EXISTS "${_zeus_vst3sdk_dir}/CMakeLists.txt")
+    message(FATAL_ERROR
+        "third_party/vst3sdk is missing or unpopulated. Run:\n"
+        "  git submodule update --init --recursive\n"
+        "from the plughost repository root.")
 endif()
 
-# ---- Phase 2 stubs (commented; do not enable in Phase 1) -------------------
-#
-# FetchContent_Declare(vst3sdk
-#     GIT_REPOSITORY https://github.com/steinbergmedia/vst3sdk.git
-#     GIT_TAG        v3.7.x        # pin once Phase 2 begins
-# )
-#
-# FetchContent_Declare(clap
-#     GIT_REPOSITORY https://github.com/free-audio/clap.git
-#     GIT_TAG        1.2.x         # pin once Phase 2 begins
-# )
-#
-# # vestige is single-header — vendor it under third_party/vestige/aeffect.h.
-# # Do not fetch via git; capture the LGPL header verbatim with origin notes.
-#
-# FetchContent_Declare(tinycbor
-#     GIT_REPOSITORY https://github.com/intel/tinycbor.git
-#     GIT_TAG        v0.6.x        # pin once Phase 2 begins
-# )
-#
-# Once Phase 2 is live, gate the calls behind ZEUS_PLUGHOST_FETCH_DEPS:
-#   if(ZEUS_PLUGHOST_FETCH_DEPS)
-#       FetchContent_MakeAvailable(vst3sdk clap tinycbor)
-#   endif()
+# The SDK builds a few utility / wrapper subprojects unconditionally even
+# with the example flags off; that is fine — the only ones we link below
+# are the three canonical targets (sdk_hosting, base, pluginterfaces).
+add_subdirectory(${_zeus_vst3sdk_dir} ${CMAKE_BINARY_DIR}/_vst3sdk EXCLUDE_FROM_ALL)
+
+# Expose the platform-specific module loader source path. sdk_hosting
+# contains the platform-agnostic Module facade (module.cpp) but does NOT
+# include module_linux.cpp / module_mac.mm / module_win32.cpp — examples
+# pick the right one per platform. We link our own selection in via
+# zeus-plughost target sources.
+if(WIN32)
+    set(ZEUS_PLUGHOST_VST3_MODULE_IMPL
+        "${_zeus_vst3sdk_dir}/public.sdk/source/vst/hosting/module_win32.cpp"
+        CACHE INTERNAL "")
+elseif(APPLE)
+    set(ZEUS_PLUGHOST_VST3_MODULE_IMPL
+        "${_zeus_vst3sdk_dir}/public.sdk/source/vst/hosting/module_mac.mm"
+        CACHE INTERNAL "")
+else()
+    set(ZEUS_PLUGHOST_VST3_MODULE_IMPL
+        "${_zeus_vst3sdk_dir}/public.sdk/source/vst/hosting/module_linux.cpp"
+        CACHE INTERNAL "")
+endif()

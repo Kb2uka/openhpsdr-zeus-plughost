@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.25)
 
 project(zeus-plughost
     VERSION 0.1.0
@@ -19,7 +19,10 @@ endif()
 # Platform detection + sanity checks (32 vs 64-bit, etc).
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/platform.cmake)
 
-# Dependency stubs (FetchContent for vst3sdk / clap / vestige; disabled in Phase 1).
+# Dependency wiring: pulls in the VST 3 SDK submodule with the SDK's own
+# example / VSTGUI targets disabled. After this we have sdk_hosting / base
+# / pluginterfaces targets available, plus ZEUS_PLUGHOST_VST3_MODULE_IMPL
+# pointing at the per-platform Module loader source.
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/deps.cmake)
 
 # ---------------------------------------------------------------------------
@@ -30,9 +33,14 @@ set(ZEUS_PLUGHOST_SOURCES
     src/ipc/shm_ring.cpp
     src/ipc/control_pipe.cpp
     src/audio/passthrough.cpp
+    src/vst3/plugin_host.cpp
+    # Platform-specific Module loader from the VST 3 SDK. Defined by
+    # cmake/deps.cmake based on the host triple; we compile it directly
+    # into our binary so the SDK's example target tree stays disabled.
+    ${ZEUS_PLUGHOST_VST3_MODULE_IMPL}
 )
 
-# Per-platform wakeup primitive impl. Stubs on Win/Mac in Phase 1.
+# Per-platform wakeup primitive impl. Stubs on Win/Mac in Phase 2.
 if(WIN32)
     list(APPEND ZEUS_PLUGHOST_SOURCES src/ipc/wakeup_windows.cpp)
 elseif(APPLE)
@@ -47,9 +55,12 @@ add_executable(zeus-plughost ${ZEUS_PLUGHOST_SOURCES})
 
 target_include_directories(zeus-plughost PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/vst3sdk
 )
 
-# Warnings-as-errors: GCC/Clang on Linux/Mac, MSVC on Windows.
+# Warnings-as-errors: GCC/Clang on Linux/Mac, MSVC on Windows. SDK headers
+# may emit warnings — those are quarantined behind src/vst3/sdk_includes.h
+# (pragma diagnostic push/ignored/pop) so we do not relax -Werror globally.
 if(MSVC)
     target_compile_options(zeus-plughost PRIVATE /W4 /WX /permissive-)
 else()
@@ -59,16 +70,39 @@ else()
     )
 endif()
 
+# The SDK's module_linux.cpp / module_mac.mm / module_win32.cpp source
+# files are not authored to our -Wall -Wextra -Werror discipline; relax
+# warnings on those individual translation units only.
+set_source_files_properties(${ZEUS_PLUGHOST_VST3_MODULE_IMPL} PROPERTIES
+    COMPILE_FLAGS "-w")
+
+# Apple's Objective-C++ Module loader needs ARC; matches the SDK examples.
+if(APPLE)
+    set_source_files_properties(${ZEUS_PLUGHOST_VST3_MODULE_IMPL} PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc -w")
+endif()
+
 # Link platform threading library (UNIX) — Win threads are intrinsic to MSVCRT.
 if(UNIX)
     find_package(Threads REQUIRED)
     target_link_libraries(zeus-plughost PRIVATE Threads::Threads)
 endif()
 
-# Linux-specific: rt for shm_open, futex via syscall in libc.
+# Linux-specific: rt for shm_open, dl for the Module loader's dlopen.
 if(UNIX AND NOT APPLE)
-    target_link_libraries(zeus-plughost PRIVATE rt)
+    target_link_libraries(zeus-plughost PRIVATE rt dl)
 endif()
+
+if(APPLE)
+    target_link_libraries(zeus-plughost PRIVATE "-framework CoreFoundation")
+endif()
+
+# VST 3 SDK static libraries. sdk_hosting pulls in sdk_common transitively.
+target_link_libraries(zeus-plughost PRIVATE
+    sdk_hosting
+    base
+    pluginterfaces
+)
 
 # Output binary name is identical across platforms; CMake adds .exe on Windows.
 set_target_properties(zeus-plughost PROPERTIES OUTPUT_NAME "zeus-plughost")

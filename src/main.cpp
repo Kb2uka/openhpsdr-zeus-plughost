@@ -33,6 +33,7 @@
 #include "ipc/control_pipe.h"
 #include "ipc/shm_ring.h"
 #include "ipc/wakeup.h"
+#include "vst3/plugin_host.h"
 
 namespace {
 
@@ -213,8 +214,53 @@ int main(int argc, char** argv) {
             "zeus-plughost: handshake OK (proto=%u rate=%u frames=%u ch=%u)\n",
             protoVer, sampleRate, framesPerBlock, channels);
 
-        // 5. Background control-read thread. Reads Goodbye / Heartbeat
-        //    messages while the audio thread runs the pass-through loop.
+        // Single-slot VST3 plugin host. Constructed before the audio
+        // loop; the audio thread peeks via atomic<ActivePlugin*>, control
+        // thread mutates via Load/Unload calls.
+        vst3::PluginHost pluginHost;
+
+        // Helper: encode + send a LoadPluginResult control message.
+        auto sendLoadResult =
+            [&](std::uint8_t status,
+                const std::string& name,
+                const std::string& vendor,
+                const std::string& version,
+                const std::string& errorMessage) {
+            std::vector<std::uint8_t> body;
+            body.reserve(64 + name.size() + vendor.size()
+                              + version.size() + errorMessage.size());
+            body.push_back(status);
+            auto appendU32Le = [&](std::uint32_t v) {
+                body.push_back(static_cast<std::uint8_t>(v & 0xFFu));
+                body.push_back(static_cast<std::uint8_t>((v >> 8) & 0xFFu));
+                body.push_back(static_cast<std::uint8_t>((v >> 16) & 0xFFu));
+                body.push_back(static_cast<std::uint8_t>((v >> 24) & 0xFFu));
+            };
+            auto appendString = [&](const std::string& s) {
+                appendU32Le(static_cast<std::uint32_t>(s.size()));
+                body.insert(body.end(), s.begin(), s.end());
+            };
+            if (status == 0) {
+                appendString(name);
+                appendString(vendor);
+                appendString(version);
+            } else {
+                appendString(errorMessage);
+            }
+            control.Send(ControlMessageTag::LoadPluginResult,
+                         body.data(), body.size());
+        };
+
+        auto sendUnloadResult = [&](std::uint8_t status) {
+            std::uint8_t one = status;
+            control.Send(ControlMessageTag::UnloadPluginResult, &one, 1);
+        };
+
+        // 5. Background control-read thread. Reads Goodbye / Heartbeat /
+        //    LoadPlugin / UnloadPlugin while the audio thread runs the
+        //    pass-through loop. Plugin Load/Unload calls run on this
+        //    thread (slow first-load is allowed); Process() runs on the
+        //    audio thread.
         std::atomic<bool> stopFromControl{false};
         std::thread controlReader([&]() {
             while (!g_stopFlag && !stopFromControl.load(std::memory_order_relaxed)) {
@@ -233,6 +279,51 @@ int main(int argc, char** argv) {
                 if (t == ControlMessageTag::Goodbye) {
                     stopFromControl.store(true, std::memory_order_relaxed);
                     return;
+                }
+                if (t == ControlMessageTag::LoadPlugin) {
+                    // Payload: u32 pathLen LE + UTF-8 bytes.
+                    if (p.size() < 4) {
+                        sendLoadResult(5, {}, {}, {}, "LoadPlugin payload truncated");
+                        continue;
+                    }
+                    std::uint32_t pathLen =
+                        static_cast<std::uint32_t>(p[0])
+                        | (static_cast<std::uint32_t>(p[1]) << 8)
+                        | (static_cast<std::uint32_t>(p[2]) << 16)
+                        | (static_cast<std::uint32_t>(p[3]) << 24);
+                    if (p.size() != 4u + pathLen) {
+                        sendLoadResult(5, {}, {}, {},
+                            "LoadPlugin payload size mismatch");
+                        continue;
+                    }
+                    std::string path(reinterpret_cast<const char*>(p.data() + 4),
+                                     pathLen);
+                    auto result = pluginHost.Load(
+                        path,
+                        static_cast<double>(kPhase1SampleRate),
+                        static_cast<std::int32_t>(kPhase1Frames));
+                    if (auto* info = std::get_if<vst3::LoadInfo>(&result)) {
+                        std::fprintf(stderr,
+                            "zeus-plughost: loaded plugin name='%s' vendor='%s' "
+                            "version='%s'\n",
+                            info->name.c_str(), info->vendor.c_str(),
+                            info->version.c_str());
+                        sendLoadResult(0, info->name, info->vendor, info->version, {});
+                    } else {
+                        const auto& err = std::get<vst3::LoadError>(result);
+                        std::fprintf(stderr,
+                            "zeus-plughost: load failed status=%u msg='%s'\n",
+                            static_cast<unsigned>(err.status),
+                            err.message.c_str());
+                        sendLoadResult(err.status, {}, {}, {}, err.message);
+                    }
+                    continue;
+                }
+                if (t == ControlMessageTag::UnloadPlugin) {
+                    bool wasLoaded = pluginHost.IsLoaded();
+                    pluginHost.Unload();
+                    sendUnloadResult(wasLoaded ? 0u : 1u);
+                    continue;
                 }
                 // Heartbeat or anything else: ignore silently in Phase 2.
             }
@@ -261,15 +352,16 @@ int main(int argc, char** argv) {
         });
 
         // The pass-through loop reads the input ring on the h2s wakeup,
-        // memcpys to the output slot, and posts on the s2h wakeup. The
-        // PassthroughStats counter increments per round-trip.
+        // runs the plugin if loaded (otherwise memcpy), and posts on the
+        // s2h wakeup. The PassthroughStats counter increments per round-trip.
         RunPassthrough(inputMapping.Ring(),
                        outputMapping.Ring(),
                        inputWakeup,
                        outputWakeup,
                        stats,
                        g_stopFlag,
-                       stopFromControl);
+                       stopFromControl,
+                       &pluginHost);
 
         if (heartbeat.joinable())     heartbeat.join();
         if (controlReader.joinable()) controlReader.join();
