@@ -1,0 +1,8 @@
+# Phase 2 will populate this directory with vendor SDKs as git submodules:
+#
+#   - vst3sdk  : https://github.com/steinbergmedia/vst3sdk    (MIT)
+#   - clap     : https://github.com/free-audio/clap           (MIT)
+#   - vestige  : VST2 single-header (LGPL) — vendor verbatim
+#   - tinycbor : https://github.com/intel/tinycbor            (MIT)  (optional, control plane)
+#
+# Phase 1 is plugin-free; the directory is intentionally empty.

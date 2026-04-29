@@ -1,0 +1,40 @@
+# Build outputs
+build/
+out/
+cmake-build-*/
+
+# CMake artefacts
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+*.cmake.in.tmp
+
+# Compiler outputs
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.exp
+*.pdb
+*.ilk
+*.idb
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Third-party vendor build dirs (when submodules are added in Phase 2)
+third_party/*/build/
+third_party/*/CMakeFiles/
+third_party/*/CMakeCache.txt
