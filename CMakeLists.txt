@@ -41,6 +41,18 @@ set(ZEUS_PLUGHOST_SOURCES
     ${ZEUS_PLUGHOST_VST3_MODULE_IMPL}
 )
 
+# Phase 3 GUI: native plugin editor windows. Linux only this wave —
+# Windows (HWND) and macOS (NSView) come in a later wave once the
+# operator moves to those platforms.
+if(UNIX AND NOT APPLE)
+    list(APPEND ZEUS_PLUGHOST_SOURCES
+        src/vst3/host_run_loop.cpp
+        src/vst3/host_plug_frame.cpp
+        src/vst3/editor_window.cpp
+        src/vst3/gui_thread.cpp
+    )
+endif()
+
 # Per-platform wakeup primitive impl. Stubs on Win/Mac in Phase 2.
 if(WIN32)
     list(APPEND ZEUS_PLUGHOST_SOURCES src/ipc/wakeup_windows.cpp)
@@ -89,9 +101,12 @@ if(UNIX)
     target_link_libraries(zeus-plughost PRIVATE Threads::Threads)
 endif()
 
-# Linux-specific: rt for shm_open, dl for the Module loader's dlopen.
+# Linux-specific: rt for shm_open, dl for the Module loader's dlopen,
+# X11 for the Phase 3 GUI editor windows.
 if(UNIX AND NOT APPLE)
     target_link_libraries(zeus-plughost PRIVATE rt dl)
+    find_package(X11 REQUIRED)
+    target_link_libraries(zeus-plughost PRIVATE X11::X11)
 endif()
 
 if(APPLE)

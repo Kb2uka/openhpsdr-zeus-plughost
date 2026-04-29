@@ -2,6 +2,8 @@
 
 #include "vst3/plugin_chain.h"
 
+#include "pluginterfaces/gui/iplugview.h"
+
 #include <cmath>
 #include <cstring>
 #include <utility>
@@ -30,6 +32,7 @@ PluginChain::~PluginChain() {
     for (int i = 0; i < kMaxSlots; ++i) {
         loaded_[i].store(false, std::memory_order_release);
         if (slots_[i]) {
+            slots_[i]->ReleaseEditorView();
             slots_[i]->Unload();
         }
     }
@@ -62,6 +65,10 @@ std::uint8_t PluginChain::UnloadSlot(int slotIdx) {
     }
     std::lock_guard<std::mutex> guard(chainMutex_);
     bool was = loaded_[slotIdx].exchange(false, std::memory_order_acq_rel);
+    // Safety net: caller is supposed to close any editor first via the
+    // GUI thread (main.cpp does this), but if a path missed it, drop
+    // our refcount on the view before tearing the plugin down.
+    slots_[slotIdx]->ReleaseEditorView();
     slots_[slotIdx]->Unload();
     return was ? 0u : 1u;
 }
@@ -194,6 +201,25 @@ void PluginChain::Process(const float* in, float* out,
         // Bit-identical pass-through.
         std::memcpy(out, in, bytes);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 GUI editor-view facade (control thread only)
+// ---------------------------------------------------------------------------
+
+Steinberg::IPlugView* PluginChain::AcquireEditorView(int slotIdx) {
+    if (slotIdx < 0 || slotIdx >= kMaxSlots) return nullptr;
+    std::lock_guard<std::mutex> guard(chainMutex_);
+    if (!loaded_[slotIdx].load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+    return slots_[slotIdx]->AcquireEditorView();
+}
+
+void PluginChain::ReleaseEditorView(int slotIdx) {
+    if (slotIdx < 0 || slotIdx >= kMaxSlots) return;
+    std::lock_guard<std::mutex> guard(chainMutex_);
+    slots_[slotIdx]->ReleaseEditorView();
 }
 
 }  // namespace zeus::plughost::vst3

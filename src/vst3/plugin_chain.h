@@ -31,6 +31,10 @@
 
 #include "vst3/plugin_host.h"
 
+namespace Steinberg {
+class IPlugView;
+}
+
 namespace zeus::plughost::vst3 {
 
 class PluginChain {
@@ -87,6 +91,16 @@ public:
     //   7 = controller-unavailable
     std::uint8_t SetParam(int slotIdx, std::uint32_t paramId,
                           double normalized, double& outActual);
+
+    // Phase 3 GUI: acquire the slot's plugin editor view. Returns null
+    // if the slot is empty or the plugin has no editor / controller.
+    // The pointer is owned by the slot's PluginHost; do NOT call
+    // release() / FUnknownPtr::release() yourself — pair with
+    // ReleaseEditorView when done.
+    Steinberg::IPlugView* AcquireEditorView(int slotIdx);
+
+    // Idempotent. Drops the slot's editor view if held.
+    void ReleaseEditorView(int slotIdx);
 
     // ---- Audio thread API -------------------------------------------------
 

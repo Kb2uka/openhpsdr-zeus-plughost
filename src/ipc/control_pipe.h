@@ -31,6 +31,14 @@
 //   0x21 SlotParamListResult
 //   0x22 SlotSetParam
 //   0x23 SlotSetParamResult
+//
+// Phase 3 GUI (Linux X11; Win/Mac in Wave 6+):
+//   0x30 SlotShowEditor       host -> sidecar (u8 slot)
+//   0x31 SlotShowEditorResult sidecar -> host (u8 slot + u8 status [+ u32 w + u32 h])
+//   0x32 SlotHideEditor       host -> sidecar (u8 slot)
+//   0x33 SlotHideEditorResult sidecar -> host (u8 slot + u8 status)
+//   0x34 EditorClosed         sidecar -> host ASYNC (u8 slot)
+//   0x35 EditorResized        sidecar -> host ASYNC (u8 slot + u32 w + u32 h)
 
 #pragma once
 
@@ -63,6 +71,12 @@ enum class ControlMessageTag : std::uint8_t {
     SlotParamListResult     = 0x21,
     SlotSetParam            = 0x22,
     SlotSetParamResult      = 0x23,
+    SlotShowEditor          = 0x30,
+    SlotShowEditorResult    = 0x31,
+    SlotHideEditor          = 0x32,
+    SlotHideEditorResult    = 0x33,
+    EditorClosed            = 0x34,
+    EditorResized           = 0x35,
 };
 
 class ControlPipe {

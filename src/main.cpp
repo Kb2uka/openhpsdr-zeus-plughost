@@ -36,6 +36,18 @@
 #include "vst3/plugin_chain.h"
 #include "vst3/plugin_host.h"
 
+// Phase 3 GUI is Linux-only this wave; Win/Mac sidecar GUI lands in a
+// later wave with platform-specific message-pump implementations.
+#if defined(__linux__) && !defined(__APPLE__)
+#  define ZEUS_PLUGHOST_HAS_GUI 1
+#  include "vst3/gui_thread.h"
+#  include "pluginterfaces/gui/iplugview.h"
+#else
+#  define ZEUS_PLUGHOST_HAS_GUI 0
+#endif
+
+#include <mutex>
+
 namespace {
 
 // Wired to SIGINT / SIGTERM so the audio loop can break out cleanly. Marked
@@ -223,6 +235,22 @@ int main(int argc, char** argv) {
             static_cast<double>(kPhase1SampleRate),
             static_cast<std::int32_t>(kPhase1Frames));
 
+#if ZEUS_PLUGHOST_HAS_GUI
+        // Phase 3 GUI: lazy GUI thread. Started on first SlotShowEditor.
+        vst3::GuiThread guiThread;
+#endif
+
+        // Two writers will hit the control socket: the control-reader
+        // thread (sync replies) and the GUI thread (async EditorClosed /
+        // EditorResized). ControlPipe::Send is not internally
+        // synchronised, so serialise here.
+        std::mutex controlSendMutex;
+        auto sendFrame = [&](ControlMessageTag tag,
+                             const std::uint8_t* data, std::size_t size) {
+            std::lock_guard<std::mutex> lk(controlSendMutex);
+            return control.Send(tag, data, size);
+        };
+
         // ---- helpers: little-endian byte appenders ----
         auto appendU8 = [](std::vector<std::uint8_t>& body, std::uint8_t v) {
             body.push_back(v);
@@ -296,13 +324,13 @@ int main(int argc, char** argv) {
             body.reserve(64 + name.size() + vendor.size()
                               + version.size() + errorMessage.size());
             buildLoadResultBody(status, name, vendor, version, errorMessage, body);
-            control.Send(ControlMessageTag::LoadPluginResult,
-                         body.data(), body.size());
+            sendFrame(ControlMessageTag::LoadPluginResult,
+                      body.data(), body.size());
         };
 
         auto sendUnloadResult = [&](std::uint8_t status) {
             std::uint8_t one = status;
-            control.Send(ControlMessageTag::UnloadPluginResult, &one, 1);
+            sendFrame(ControlMessageTag::UnloadPluginResult, &one, 1);
         };
 
         auto sendSlotLoadResult =
@@ -324,23 +352,23 @@ int main(int argc, char** argv) {
             } else {
                 appendString(body, errorMessage);
             }
-            control.Send(ControlMessageTag::SlotLoadPluginResult,
-                         body.data(), body.size());
+            sendFrame(ControlMessageTag::SlotLoadPluginResult,
+                      body.data(), body.size());
         };
 
         auto sendSlotUnloadResult = [&](std::uint8_t slot, std::uint8_t status) {
             std::uint8_t buf[2] = { slot, status };
-            control.Send(ControlMessageTag::SlotUnloadPluginResult, buf, 2);
+            sendFrame(ControlMessageTag::SlotUnloadPluginResult, buf, 2);
         };
 
         auto sendSlotBypassResult = [&](std::uint8_t slot, std::uint8_t status) {
             std::uint8_t buf[2] = { slot, status };
-            control.Send(ControlMessageTag::SlotSetBypassResult, buf, 2);
+            sendFrame(ControlMessageTag::SlotSetBypassResult, buf, 2);
         };
 
         auto sendChainEnabledResult = [&](std::uint8_t status) {
             std::uint8_t one = status;
-            control.Send(ControlMessageTag::SetChainEnabledResult, &one, 1);
+            sendFrame(ControlMessageTag::SetChainEnabledResult, &one, 1);
         };
 
         auto sendSlotParamListResult =
@@ -361,8 +389,8 @@ int main(int argc, char** argv) {
                     appendU8(body, p.flags);
                 }
             }
-            control.Send(ControlMessageTag::SlotParamListResult,
-                         body.data(), body.size());
+            sendFrame(ControlMessageTag::SlotParamListResult,
+                      body.data(), body.size());
         };
 
         auto sendSlotSetParamResult =
@@ -374,9 +402,73 @@ int main(int argc, char** argv) {
             appendU32Le(body, paramId);
             body.push_back(status);
             appendF64Le(body, actual);
-            control.Send(ControlMessageTag::SlotSetParamResult,
-                         body.data(), body.size());
+            sendFrame(ControlMessageTag::SlotSetParamResult,
+                      body.data(), body.size());
         };
+
+        auto sendSlotShowEditorResult =
+            [&](std::uint8_t slot, std::uint8_t status,
+                std::uint32_t width, std::uint32_t height) {
+            std::vector<std::uint8_t> body;
+            body.reserve(10);
+            body.push_back(slot);
+            body.push_back(status);
+            if (status == 0) {
+                appendU32Le(body, width);
+                appendU32Le(body, height);
+            }
+            sendFrame(ControlMessageTag::SlotShowEditorResult,
+                      body.data(), body.size());
+        };
+
+        auto sendSlotHideEditorResult = [&](std::uint8_t slot,
+                                            std::uint8_t status) {
+            std::uint8_t buf[2] = { slot, status };
+            sendFrame(ControlMessageTag::SlotHideEditorResult, buf, 2);
+        };
+
+        // Async events (0x34 EditorClosed, 0x35 EditorResized) — fire
+        // unsolicited from the GUI thread. .NET dispatches them via
+        // event handlers, not awaiting tasks.
+        auto sendEditorClosed = [&](std::uint8_t slot) {
+            sendFrame(ControlMessageTag::EditorClosed, &slot, 1);
+        };
+        auto sendEditorResized = [&](std::uint8_t slot,
+                                     std::uint32_t width,
+                                     std::uint32_t height) {
+            std::vector<std::uint8_t> body;
+            body.reserve(9);
+            body.push_back(slot);
+            appendU32Le(body, width);
+            appendU32Le(body, height);
+            sendFrame(ControlMessageTag::EditorResized,
+                      body.data(), body.size());
+        };
+
+#if ZEUS_PLUGHOST_HAS_GUI
+        // The GUI thread will call this from its own thread when the
+        // operator closes the WM frame or the plugin requests a resize.
+        guiThread.SetAsyncCallback(
+            [&](vst3::GuiThread::AsyncEventTag tag,
+                int slotIdx, int w, int h) {
+            if (slotIdx < 0 || slotIdx > 0xFF) return;
+            const auto slotByte = static_cast<std::uint8_t>(slotIdx);
+            if (tag == vst3::GuiThread::AsyncEventTag::EditorClosed) {
+                // The GUI thread has already torn the editor down. Drop
+                // our refcount on the IPlugView so re-Show can re-acquire.
+                pluginChain.ReleaseEditorView(slotIdx);
+                sendEditorClosed(slotByte);
+            } else if (tag == vst3::GuiThread::AsyncEventTag::EditorResized) {
+                if (w < 0) w = 0;
+                if (h < 0) h = 0;
+                sendEditorResized(slotByte,
+                    static_cast<std::uint32_t>(w),
+                    static_cast<std::uint32_t>(h));
+            }
+        });
+#else
+        (void)sendEditorClosed; (void)sendEditorResized;
+#endif
 
         // 5. Background control-read thread. Reads Goodbye / Heartbeat /
         //    LoadPlugin / UnloadPlugin while the audio thread runs the
@@ -416,6 +508,15 @@ int main(int argc, char** argv) {
                     }
                     std::string path(reinterpret_cast<const char*>(p.data() + 4),
                                      pathLen);
+#if ZEUS_PLUGHOST_HAS_GUI
+                    if (guiThread.IsRunning()) {
+                        if (guiThread.RequestHide(0)) {
+                            pluginChain.ReleaseEditorView(0);
+                            std::uint8_t s0 = 0;
+                            sendFrame(ControlMessageTag::EditorClosed, &s0, 1);
+                        }
+                    }
+#endif
                     auto result = pluginChain.LoadSlot(0, path);
                     if (auto* info = std::get_if<vst3::LoadInfo>(&result)) {
                         std::fprintf(stderr,
@@ -436,6 +537,16 @@ int main(int argc, char** argv) {
                 }
                 if (t == ControlMessageTag::UnloadPlugin) {
                     // Backwards-compat: 0x12 == slot-0 SlotUnloadPlugin.
+                    // Auto-close any open editor for this slot first.
+                    if (guiThread.IsRunning()) {
+                        if (guiThread.RequestHide(0)) {
+                            pluginChain.ReleaseEditorView(0);
+                            // Surface the auto-close as an async event so
+                            // the host UI can refresh its "edit" state.
+                            std::uint8_t s0 = 0;
+                            sendFrame(ControlMessageTag::EditorClosed, &s0, 1);
+                        }
+                    }
                     std::uint8_t st = pluginChain.UnloadSlot(0);
                     sendUnloadResult(st);
                     continue;
@@ -456,6 +567,16 @@ int main(int argc, char** argv) {
                     }
                     std::string path(reinterpret_cast<const char*>(p.data() + 5),
                                      pathLen);
+#if ZEUS_PLUGHOST_HAS_GUI
+                    if (guiThread.IsRunning() &&
+                        slot < vst3::PluginChain::kMaxSlots) {
+                        if (guiThread.RequestHide(static_cast<int>(slot))) {
+                            pluginChain.ReleaseEditorView(
+                                static_cast<int>(slot));
+                            sendFrame(ControlMessageTag::EditorClosed, &slot, 1);
+                        }
+                    }
+#endif
                     auto result = pluginChain.LoadSlot(static_cast<int>(slot), path);
                     if (auto* info = std::get_if<vst3::LoadInfo>(&result)) {
                         std::fprintf(stderr,
@@ -479,6 +600,18 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     std::uint8_t slot = p[0];
+                    // Auto-close any open editor first; emit async so
+                    // the host UI knows to forget its "open" state.
+#if ZEUS_PLUGHOST_HAS_GUI
+                    if (guiThread.IsRunning() &&
+                        slot < vst3::PluginChain::kMaxSlots) {
+                        if (guiThread.RequestHide(static_cast<int>(slot))) {
+                            pluginChain.ReleaseEditorView(
+                                static_cast<int>(slot));
+                            sendFrame(ControlMessageTag::EditorClosed, &slot, 1);
+                        }
+                    }
+#endif
                     std::uint8_t st = pluginChain.UnloadSlot(static_cast<int>(slot));
                     sendSlotUnloadResult(slot, st);
                     continue;
@@ -532,6 +665,91 @@ int main(int argc, char** argv) {
                     sendSlotSetParamResult(slot, paramId, st, actual);
                     continue;
                 }
+#if ZEUS_PLUGHOST_HAS_GUI
+                if (t == ControlMessageTag::SlotShowEditor) {
+                    if (p.size() != 1) {
+                        sendSlotShowEditorResult(0xFFu, 5, 0, 0);
+                        continue;
+                    }
+                    std::uint8_t slot = p[0];
+                    if (slot >= vst3::PluginChain::kMaxSlots) {
+                        sendSlotShowEditorResult(slot, 6, 0, 0);
+                        continue;
+                    }
+                    if (!pluginChain.IsSlotLoaded(static_cast<int>(slot))) {
+                        sendSlotShowEditorResult(slot, 1, 0, 0);
+                        continue;
+                    }
+                    if (!guiThread.Start()) {
+                        sendSlotShowEditorResult(slot, 7, 0, 0);
+                        continue;
+                    }
+                    Steinberg::IPlugView* view =
+                        pluginChain.AcquireEditorView(static_cast<int>(slot));
+                    if (view == nullptr) {
+                        sendSlotShowEditorResult(slot, 2, 0, 0);
+                        continue;
+                    }
+                    // Use the loaded plugin's display name as the title.
+                    // (PluginChain doesn't expose an info getter; use a
+                    // generic fallback. Future polish: surface name via
+                    // CurrentInfo on slot.)
+                    std::string title = "Plugin Editor — slot " + std::to_string(slot);
+                    auto rsp = guiThread.RequestShow(
+                        static_cast<int>(slot), view, title);
+                    if (!rsp.ok) {
+                        // Drop our ref; on next show we'll createView again.
+                        pluginChain.ReleaseEditorView(static_cast<int>(slot));
+                        sendSlotShowEditorResult(slot, rsp.status, 0, 0);
+                        continue;
+                    }
+                    sendSlotShowEditorResult(slot, 0,
+                        static_cast<std::uint32_t>(rsp.width),
+                        static_cast<std::uint32_t>(rsp.height));
+                    continue;
+                }
+                if (t == ControlMessageTag::SlotHideEditor) {
+                    if (p.size() != 1) {
+                        sendSlotHideEditorResult(0xFFu, 5);
+                        continue;
+                    }
+                    std::uint8_t slot = p[0];
+                    if (slot >= vst3::PluginChain::kMaxSlots) {
+                        sendSlotHideEditorResult(slot, 6);
+                        continue;
+                    }
+                    if (!guiThread.IsRunning()) {
+                        sendSlotHideEditorResult(slot, 1);
+                        continue;
+                    }
+                    bool wasOpen = guiThread.RequestHide(
+                        static_cast<int>(slot));
+                    if (wasOpen) {
+                        pluginChain.ReleaseEditorView(static_cast<int>(slot));
+                        sendSlotHideEditorResult(slot, 0);
+                    } else {
+                        sendSlotHideEditorResult(slot, 1);
+                    }
+                    continue;
+                }
+#else
+                if (t == ControlMessageTag::SlotShowEditor) {
+                    if (p.size() != 1) {
+                        sendSlotShowEditorResult(0xFFu, 5, 0, 0);
+                        continue;
+                    }
+                    sendSlotShowEditorResult(p[0], 3, 0, 0); // platform-not-supported
+                    continue;
+                }
+                if (t == ControlMessageTag::SlotHideEditor) {
+                    if (p.size() != 1) {
+                        sendSlotHideEditorResult(0xFFu, 5);
+                        continue;
+                    }
+                    sendSlotHideEditorResult(p[0], 1);
+                    continue;
+                }
+#endif
                 // Heartbeat or anything else: ignore silently.
             }
         });
@@ -572,6 +790,13 @@ int main(int argc, char** argv) {
 
         if (heartbeat.joinable())     heartbeat.join();
         if (controlReader.joinable()) controlReader.join();
+
+#if ZEUS_PLUGHOST_HAS_GUI
+        // Detach the async callback BEFORE Stop() so any final teardown
+        // events don't try to write to a control socket we're closing.
+        guiThread.SetAsyncCallback({});
+        guiThread.Stop();
+#endif
 
         control.Close();
         // Mappings + wakeups close via their dtors; we don't shm_unlink

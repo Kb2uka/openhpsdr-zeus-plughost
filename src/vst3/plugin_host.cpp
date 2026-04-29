@@ -31,6 +31,8 @@
 #include "vst3/plugin_host.h"
 #include "vst3/sdk_includes.h"
 
+#include "pluginterfaces/gui/iplugview.h"
+
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -78,6 +80,7 @@ struct ActivePlugin {
     bool                       singleComponent = false;  // controller == component
     IPtr<IConnectionPoint>     componentCp;
     IPtr<IConnectionPoint>     controllerCp;
+    IPtr<Steinberg::IPlugView> editorView;     // null until AcquireEditorView
     LoadInfo                   info;
     std::int32_t               maxBlockSize;
     double                     sampleRate;
@@ -282,6 +285,14 @@ std::unique_ptr<ActivePlugin> InstantiateAndActivate(
 
 void TearDownActive(ActivePlugin* a) noexcept {
     if (a == nullptr) return;
+    // Drop the editor view first if any — by the time we reach Unload,
+    // the GUI thread should have closed any window, but if the unload
+    // is racing with a still-attached editor we just drop our refcount
+    // and the plugin handles the dangling embed. PluginChain forces
+    // editor close before calling Unload, so this is the safety net.
+    if (a->editorView) {
+        a->editorView = nullptr;
+    }
     if (a->processor) {
         a->processor->setProcessing(false);
     }
@@ -560,6 +571,35 @@ double PluginHost::SetParam(std::uint32_t paramId, double normalized) {
     a->controller->setParamNormalized(static_cast<ParamID>(paramId), normalized);
     // Read back what the plugin actually accepted (post quantise / clamp).
     return a->controller->getParamNormalized(static_cast<ParamID>(paramId));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 GUI: editor view acquisition.
+// ---------------------------------------------------------------------------
+
+Steinberg::IPlugView* PluginHost::AcquireEditorView() {
+    std::lock_guard<std::mutex> guard(impl_->controlMutex);
+    ActivePlugin* a = impl_->active.load(std::memory_order_acquire);
+    if (a == nullptr || !a->controller) {
+        return nullptr;
+    }
+    if (!a->editorView) {
+        // controller->createView returns an already-AddRef'd raw pointer.
+        Steinberg::IPlugView* raw = a->controller->createView(
+            Steinberg::Vst::ViewType::kEditor);
+        if (raw == nullptr) {
+            return nullptr;
+        }
+        a->editorView = Steinberg::owned(raw);
+    }
+    return a->editorView.get();
+}
+
+void PluginHost::ReleaseEditorView() {
+    std::lock_guard<std::mutex> guard(impl_->controlMutex);
+    ActivePlugin* a = impl_->active.load(std::memory_order_acquire);
+    if (a == nullptr) return;
+    a->editorView = nullptr;
 }
 
 }  // namespace zeus::plughost::vst3

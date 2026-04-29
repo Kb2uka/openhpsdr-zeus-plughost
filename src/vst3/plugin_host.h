@@ -36,6 +36,10 @@
 #include <variant>
 #include <vector>
 
+namespace Steinberg {
+class IPlugView;
+}
+
 namespace zeus::plughost::vst3 {
 
 // Snapshot of one VST3 parameter, copied from the plugin's
@@ -136,6 +140,21 @@ public:
     // respect to its audio-thread IComponent — that is the standard
     // VST3 contract for the controller object.
     double SetParam(std::uint32_t paramId, double normalized);
+
+    // Phase 3 GUI: acquire the plugin's IPlugView for the editor. Returns
+    // nullptr if no plugin loaded, no controller, or the controller's
+    // createView returned null. The caller (typically PluginChain via
+    // GuiThread) owns one extra refcount and MUST call ReleaseEditorView
+    // before unloading the plugin.
+    //
+    // The returned pointer is the same instance across repeated calls
+    // until ReleaseEditorView is called — Steinberg's contract is "one
+    // editor view per plugin, lifetime managed by the host". We follow
+    // that: AcquireEditorView creates on first call and reuses.
+    Steinberg::IPlugView* AcquireEditorView();
+
+    // Drop the editor view (idempotent).
+    void ReleaseEditorView();
 
 private:
     struct Impl;
