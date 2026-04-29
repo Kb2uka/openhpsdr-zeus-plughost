@@ -22,6 +22,12 @@
 #include <string>
 #include <thread>
 
+#ifdef _WIN32
+#  include <process.h>
+#else
+#  include <unistd.h>
+#endif
+
 #include "audio/block_format.h"
 #include "audio/passthrough.h"
 #include "ipc/control_pipe.h"
@@ -46,6 +52,7 @@ void PrintUsage(const char* argv0) {
         "\n"
         "USAGE:\n"
         "  %s --shm-name <NAME> --control-pipe <PATH>\n"
+        "  %s --idle\n"
         "\n"
         "REQUIRED ARGUMENTS:\n"
         "  --shm-name      Shared-memory name prefix used for input + output\n"
@@ -53,14 +60,19 @@ void PrintUsage(const char* argv0) {
         "  --control-pipe  Path (Linux/macOS AF_UNIX) or pipe name (Windows)\n"
         "                  for the control channel.\n"
         "\n"
+        "OPTIONAL ARGUMENTS:\n"
+        "  --idle          Test mode: no shm/control, heartbeat to stderr\n"
+        "                  (used by Zeus.PluginHost.Tests).\n"
+        "\n"
         "Phase 1: data-plane pass-through only. No plugin loading yet.\n"
         "See docs/PHASE1.md.\n",
-        argv0);
+        argv0, argv0);
 }
 
 struct Args {
     std::string shmName;
     std::string controlPipe;
+    bool idle = false;
 };
 
 bool ParseArgs(int argc, char** argv, Args& out) {
@@ -70,6 +82,8 @@ bool ParseArgs(int argc, char** argv, Args& out) {
             out.shmName = argv[++i];
         } else if (std::strcmp(a, "--control-pipe") == 0 && i + 1 < argc) {
             out.controlPipe = argv[++i];
+        } else if (std::strcmp(a, "--idle") == 0) {
+            out.idle = true;
         } else if (std::strcmp(a, "--help") == 0 || std::strcmp(a, "-h") == 0) {
             return false;
         } else {
@@ -77,7 +91,44 @@ bool ParseArgs(int argc, char** argv, Args& out) {
             return false;
         }
     }
+    if (out.idle) {
+        // --idle is exclusive: shm-name + control-pipe are not used.
+        return true;
+    }
     return !out.shmName.empty() && !out.controlPipe.empty();
+}
+
+// Idle/supervisor-test mode. Sleep in 1 s ticks emitting a heartbeat to
+// stderr; SIGTERM/SIGINT flip g_stopFlag and we return 0. SIGKILL has no
+// handler — the test harness uses that to verify Zeus's supervisor logic
+// notices the death, restarts cleanly, and stays up itself.
+int RunIdle() {
+    std::signal(SIGINT,  HandleStopSignal);
+    std::signal(SIGTERM, HandleStopSignal);
+
+#ifdef _WIN32
+    const long pid = static_cast<long>(_getpid());
+#else
+    const long pid = static_cast<long>(getpid());
+#endif
+    std::fprintf(stderr,
+        "zeus-plughost: idle mode (pid=%ld) — heartbeat to stderr, SIGTERM exits 0\n",
+        pid);
+
+    std::uint64_t tick = 0;
+    while (!g_stopFlag) {
+        std::fprintf(stderr,
+            "plughost idle pid=%ld tick=%llu\n",
+            pid, static_cast<unsigned long long>(tick));
+        std::fflush(stderr);
+        ++tick;
+        // Sleep in short chunks so SIGTERM is honoured promptly.
+        for (int i = 0; i < 10 && !g_stopFlag; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+    std::fprintf(stderr, "zeus-plughost: idle mode clean exit\n");
+    return 0;
 }
 
 }  // namespace
@@ -87,6 +138,10 @@ int main(int argc, char** argv) {
     if (!ParseArgs(argc, argv, args)) {
         PrintUsage(argv[0]);
         return 1;
+    }
+
+    if (args.idle) {
+        return RunIdle();
     }
 
     std::signal(SIGINT,  HandleStopSignal);
