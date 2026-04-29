@@ -1,4 +1,10 @@
-// wakeup_linux.cpp — futex-backed Wakeup impl.
+// wakeup_linux.cpp — POSIX named-semaphore Wakeup impl (Phase 2).
+//
+// On Linux, glibc's sem_open lives in librt and stores named semaphores
+// at /dev/shm/sem.<name>. The host creates the semaphore (O_CREAT, initial
+// 0); the sidecar opens by name without O_CREAT. Both call sem_post /
+// sem_timedwait. Only the host calls sem_unlink — same ownership model as
+// the shm rings.
 
 #include "ipc/wakeup.h"
 
@@ -6,65 +12,107 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <ctime>
+#include <stdexcept>
+#include <string>
 
-#include <linux/futex.h>
-#include <sys/syscall.h>
-#include <sys/time.h>
+#include <fcntl.h>
+#include <semaphore.h>
 #include <unistd.h>
 
 namespace zeus::plughost {
 
 namespace {
 
-int FutexWait(int* addr, int expected, std::uint32_t timeoutMs) {
-    timespec ts{};
-    timespec* tsPtr = nullptr;
-    if (timeoutMs != 0xFFFFFFFFu) {
-        ts.tv_sec  = static_cast<time_t>(timeoutMs / 1000);
-        ts.tv_nsec = static_cast<long>((timeoutMs % 1000) * 1'000'000);
-        tsPtr = &ts;
-    }
-    return static_cast<int>(::syscall(SYS_futex, addr, FUTEX_WAIT_PRIVATE,
-                                      expected, tsPtr, nullptr, 0));
-}
-
-int FutexWake(int* addr, int howMany) {
-    return static_cast<int>(::syscall(SYS_futex, addr, FUTEX_WAKE_PRIVATE,
-                                      howMany, nullptr, nullptr, 0));
+std::string ErrnoMessage(const char* what) {
+    char buf[256];
+    char* msg = strerror_r(errno, buf, sizeof(buf));
+    return std::string(what) + ": " + (msg ? msg : "(unknown)");
 }
 
 }  // namespace
 
-Wakeup::Wakeup() : state_(0) {}
-Wakeup::~Wakeup() = default;
+Wakeup::Wakeup() {
+    // Phase 2 default-constructed Wakeup uses an anonymous local
+    // semaphore by allocating one via sem_open with a unique name,
+    // then unlinking immediately so it has process-local lifetime.
+    // This keeps the realtime call path identical between named and
+    // unnamed cases — the audio thread always uses sem_timedwait.
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "/zeus-plughost-anon-%ld-%p",
+                  static_cast<long>(::getpid()), static_cast<void*>(this));
+    OpenInternal(buf, true);
+    if (sem_ != nullptr && !name_.empty()) {
+        ::sem_unlink(name_.c_str());
+        // Keep ownsName_=true so dtor closes; the unlink already happened.
+    }
+}
+
+Wakeup::Wakeup(const std::string& name, bool create) {
+    OpenInternal(name, create);
+}
+
+void Wakeup::OpenInternal(const std::string& name, bool create) {
+    name_ = name;
+    sem_t* s;
+    if (create) {
+        s = ::sem_open(name.c_str(), O_CREAT, 0600, 0);
+        ownsName_ = true;
+    } else {
+        s = ::sem_open(name.c_str(), 0);
+        ownsName_ = false;
+    }
+    if (s == SEM_FAILED) {
+        throw std::runtime_error(ErrnoMessage("sem_open"));
+    }
+    sem_ = static_cast<void*>(s);
+}
+
+Wakeup::~Wakeup() {
+    if (sem_ != nullptr) {
+        ::sem_close(static_cast<sem_t*>(sem_));
+        sem_ = nullptr;
+    }
+    if (ownsName_ && !name_.empty()) {
+        ::sem_unlink(name_.c_str());
+    }
+}
 
 bool Wakeup::Wait(std::uint32_t timeoutMs) {
-    // Spin once on the cheap path: if state_ is already non-zero, consume
-    // it without entering the kernel.
-    auto* atomic_state = reinterpret_cast<std::atomic<int>*>(&state_);
-    int observed = atomic_state->exchange(0, std::memory_order_acquire);
-    if (observed != 0) {
+    if (sem_ == nullptr) return false;
+
+    if (timeoutMs == 0xFFFFFFFFu) {
+        while (::sem_wait(static_cast<sem_t*>(sem_)) != 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
         return true;
     }
 
-    int rc = FutexWait(&state_, 0, timeoutMs);
-    if (rc == 0) {
-        atomic_state->store(0, std::memory_order_relaxed);
-        return true;
+    timespec ts{};
+    if (::clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        return false;
     }
-    // EAGAIN means state_ changed under us before we slept — that counts
-    // as a wake. ETIMEDOUT / EINTR are real timeouts / spurious wakes.
-    if (errno == EAGAIN) {
-        return true;
+    ts.tv_sec  += static_cast<time_t>(timeoutMs / 1000);
+    long add_ns = static_cast<long>((timeoutMs % 1000) * 1'000'000L);
+    ts.tv_nsec += add_ns;
+    if (ts.tv_nsec >= 1'000'000'000L) {
+        ts.tv_sec  += ts.tv_nsec / 1'000'000'000L;
+        ts.tv_nsec %= 1'000'000'000L;
     }
-    return false;
+
+    while (::sem_timedwait(static_cast<sem_t*>(sem_), &ts) != 0) {
+        if (errno == EINTR) continue;
+        return false;  // ETIMEDOUT or other — caller treats as timeout
+    }
+    return true;
 }
 
 void Wakeup::Signal() {
-    auto* atomic_state = reinterpret_cast<std::atomic<int>*>(&state_);
-    atomic_state->store(1, std::memory_order_release);
-    FutexWake(&state_, 1);
+    if (sem_ == nullptr) return;
+    ::sem_post(static_cast<sem_t*>(sem_));
 }
 
 }  // namespace zeus::plughost

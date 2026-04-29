@@ -1,15 +1,16 @@
-// passthrough.cpp — Phase 1 data-plane: read input ring, copy to output ring.
+// passthrough.cpp — Phase 2 data-plane: read input ring, copy to output
+// ring, post the output wakeup.
 //
 // REALTIME-AUDIO DISCIPLINE (read this before changing this file):
 //
 //   - NO malloc / new / delete on the hot path.
 //   - NO mutexes, condition_variables, or other userspace locks.
-//   - NO syscalls except the ONE wakeup primitive (Wakeup::Wait).
+//   - NO syscalls except the wakeup primitives (Wait + Signal).
 //   - NO logging, no iostream, no printf — heartbeat stats are written to a
 //     plain byte counter that a separate non-realtime thread reads.
 //
-// Phase 1 only does a planar memcpy from the input slot to the output
-// slot. The plugin chain (Phase 2) will splice in here, between Acquire()
+// Phase 2 only does a planar memcpy from the input slot to the output
+// slot. The plugin chain (Phase 3) will splice in here, between Acquire()
 // of the output slot and Publish().
 
 #include "audio/passthrough.h"
@@ -23,49 +24,55 @@
 
 namespace zeus::plughost {
 
-void RunPassthrough(ShmRing&    inputRing,
-                    ShmRing&    outputRing,
-                    Wakeup&     inputWakeup,
-                    PassthroughStats& stats,
-                    const volatile bool& stopFlag) {
-    while (!stopFlag) {
-        BlockHeader* in = inputRing.Read();
-        if (in == nullptr) {
-            // No work — block on the wakeup. 10 ms timeout so we can poll
-            // stopFlag without leaning on a global signal.
-            inputWakeup.Wait(10);
+void RunPassthrough(ShmRing&                 inputRing,
+                    ShmRing&                 outputRing,
+                    Wakeup&                  inputWakeup,
+                    Wakeup&                  outputWakeup,
+                    PassthroughStats&        stats,
+                    const volatile bool&     stopFlag,
+                    const std::atomic<bool>& controlStopFlag) {
+    while (!stopFlag && !controlStopFlag.load(std::memory_order_relaxed)) {
+        // Block on the input wakeup with a short timeout so we can poll
+        // the stop flags. The host posts this semaphore once per block.
+        if (!inputWakeup.Wait(50)) {
+            // Timeout (or interrupt). Loop back and check stop flags.
             continue;
         }
 
-        BlockHeader* out = outputRing.Acquire();
-        if (out == nullptr) {
-            // Output ring is full; the consumer (Zeus) is behind. Drop the
-            // input block to keep latency bounded — the alternative is
-            // unbounded queueing, which is worse in a realtime path.
+        // The host may have posted multiple times; drain the input ring
+        // until empty before sleeping again. Bounded by slotCount so we
+        // can never spin indefinitely.
+        for (;;) {
+            BlockHeader* in = inputRing.Read();
+            if (in == nullptr) break;
+
+            BlockHeader* out = outputRing.Acquire();
+            if (out == nullptr) {
+                // Output ring full; drop input to keep latency bounded.
+                inputRing.Release(in);
+                stats.dropped.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+
+            // Preserve seq, frames, channels, sampleRate, flags. Zero
+            // the reserved field on write per BlockHeader contract.
+            out->seq        = in->seq;
+            out->frames     = in->frames;
+            out->channels   = in->channels;
+            out->sampleRate = in->sampleRate;
+            out->flags      = in->flags;
+            std::memset(out->reserved, 0, sizeof(out->reserved));
+
+            const std::size_t bytes = static_cast<std::size_t>(in->frames)
+                                    * static_cast<std::size_t>(in->channels)
+                                    * sizeof(float);
+            std::memcpy(PayloadOf(out), PayloadOf(in), bytes);
+
+            outputRing.Publish(out);
             inputRing.Release(in);
-            stats.dropped++;
-            continue;
+            stats.processed.fetch_add(1, std::memory_order_relaxed);
+            outputWakeup.Signal();
         }
-
-        // Copy the header — preserve seq, frames, channels, sampleRate,
-        // flags. Zero the reserved field on write per BlockHeader contract.
-        out->seq        = in->seq;
-        out->frames     = in->frames;
-        out->channels   = in->channels;
-        out->sampleRate = in->sampleRate;
-        out->flags      = in->flags;
-        std::memset(out->reserved, 0, sizeof(out->reserved));
-
-        // Copy the planar payload as a single memcpy — Phase 1 has no
-        // plugin to run, so input == output.
-        const std::size_t bytes = static_cast<std::size_t>(in->frames)
-                                * static_cast<std::size_t>(in->channels)
-                                * sizeof(float);
-        std::memcpy(PayloadOf(out), PayloadOf(in), bytes);
-
-        outputRing.Publish(out);
-        inputRing.Release(in);
-        stats.processed++;
     }
 }
 

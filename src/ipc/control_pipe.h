@@ -1,18 +1,18 @@
-// control_pipe.h — control-channel abstraction.
+// control_pipe.h — control-channel abstraction (Phase 2).
 //
-// Phase 1: stub. The class exposes Open / Send / Recv / Close with a
-// length-prefixed byte-blob API. Real CBOR framing is deferred to Phase 2
-// (TODO: tinycbor or similar MIT/BSD lib).
+// AF_UNIX SOCK_STREAM client on the sidecar side. The host (.NET) is the
+// server: it bind()s and listen()s before forking us; we connect with
+// retry. Wire framing is fixed-length (4-byte little-endian payload size,
+// then 1-byte type, then `length - 1` bytes of payload).
 //
-// Transport choice (per build target):
+// Phase 2 message types (see docs/proposals/vst-host-phase2-wire.md):
+//   0x01 Hello      sidecar -> host (16 byte payload)
+//   0x02 HelloAck   host -> sidecar (no payload)
+//   0x03 Heartbeat  bidirectional (optional Phase 2)
+//   0x04 Goodbye    host -> sidecar (no payload)
+//   0x05 LogLine    sidecar -> host (UTF-8 bytes)
 //
-//   - Linux / macOS : AF_UNIX SOCK_SEQPACKET socket bound to the path
-//                     passed via --control-pipe.
-//   - Windows       : Named pipe (\\.\pipe\<name>) created with
-//                     CreateNamedPipeA.
-//
-// Phase 1 leaves both impls as no-op stubs that succeed without doing any
-// real I/O so the rest of the host can compile + run.
+// Plugin-load + parameter-change messages are Phase 3+.
 
 #pragma once
 
@@ -23,13 +23,12 @@
 
 namespace zeus::plughost {
 
-// Phase 1 message tag enum. These names are stable across phases; only the
-// payload framing changes (raw bytes -> CBOR map) when Phase 2 ships.
-enum class ControlMessageTag : std::uint16_t {
-    Hello     = 0x0001,  // host <- Zeus  : negotiate format, plugin path, ...
-    Goodbye   = 0x0002,  // either way    : graceful shutdown
-    Heartbeat = 0x0003,  // host -> Zeus  : 1 Hz liveness ping
-    LogLine   = 0x0004,  // host -> Zeus  : structured log forwarding
+enum class ControlMessageTag : std::uint8_t {
+    Hello     = 0x01,
+    HelloAck  = 0x02,
+    Heartbeat = 0x03,
+    Goodbye   = 0x04,
+    LogLine   = 0x05,
 };
 
 class ControlPipe {
@@ -40,27 +39,38 @@ public:
     ControlPipe(const ControlPipe&)            = delete;
     ControlPipe& operator=(const ControlPipe&) = delete;
 
-    // Open the platform endpoint named by `path`. On Linux/macOS this is
-    // an AF_UNIX path; on Windows it is the suffix of \\.\pipe\.
-    // Returns false on error (errno / GetLastError() unchanged).
-    //
-    // Phase 1: this records the name and returns true without opening any
-    // OS resource.
-    bool Open(const std::string& path);
+    // Open the AF_UNIX SOCK_STREAM client connection. Retries every 50 ms
+    // up to ~`timeoutMs` total to handle the race where the host has not
+    // yet bound the socket. Returns false on permanent error.
+    bool Open(const std::string& path, std::uint32_t timeoutMs = 2000);
 
-    // Send / Recv a single message. Length-prefixed framing is the caller's
-    // problem until Phase 2 lands.
-    bool Send(ControlMessageTag tag, const std::uint8_t* data, std::size_t size);
-    bool Recv(ControlMessageTag& outTag, std::vector<std::uint8_t>& outPayload);
+    // Send one length-prefixed message. Synchronous write.
+    bool Send(ControlMessageTag tag,
+              const std::uint8_t* data,
+              std::size_t size);
+
+    // Send a LogLine message containing `text`.
+    bool SendLog(const std::string& text);
+
+    // Receive one length-prefixed message, blocking until either a
+    // complete frame arrives, the peer closes (returns false with
+    // outClosed=true), or `timeoutMs` elapses.
+    bool Recv(ControlMessageTag& outTag,
+              std::vector<std::uint8_t>& outPayload,
+              std::uint32_t timeoutMs,
+              bool& outClosed);
 
     void Close();
 
-    bool IsOpen() const { return open_; }
+    bool IsOpen() const { return fd_ >= 0; }
     const std::string& Path() const { return path_; }
 
 private:
+    bool RecvAll(std::uint8_t* dst, std::size_t n,
+                 std::uint32_t timeoutMs, bool& outClosed);
+
     std::string path_;
-    bool        open_ = false;
+    int         fd_ = -1;
 };
 
 }  // namespace zeus::plughost

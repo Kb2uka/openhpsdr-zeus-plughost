@@ -1,16 +1,16 @@
 // main.cpp — sidecar entry point.
 //
-// Phase 1 contract:
-//   - Parse --shm-name <NAME> and --control-pipe <PATH>.
-//   - Allocate the input + output SPSC rings via ShmRingMapping (heap-
-//     backed for now; real shm_open / CreateFileMapping in Phase 2).
-//   - Open the control pipe (stub).
-//   - Run the data-plane pass-through loop until SIGINT / SIGTERM.
+// Phase 2 contract:
+//   - Parse --shm-name <SUFFIX> and --control-pipe <PATH>.
+//   - Connect to the control socket (host bound it before launching us).
+//   - Open the host-created shm regions /zeus-plughost-<SUFFIX>-h2s and
+//     -s2h, plus the matching named semaphores.
+//   - Send Hello, await HelloAck, then enter the audio pass-through loop.
+//   - Exit cleanly on Goodbye, control socket EOF, or SIGINT/SIGTERM.
 //
 // SIGKILL gate: see docs/PHASE1.md. The host MUST tolerate being killed
-// without warning — that means no resources Zeus would lose if we die
-// (audio rings live in shared memory, not the heap; control pipe close is
-// best-effort).
+// without warning — the kernel cleans our fds; the host owns the shm/sem
+// names and unlinks them.
 
 #include <atomic>
 #include <chrono>
@@ -51,21 +51,21 @@ void PrintUsage(const char* argv0) {
         "zeus-plughost — out-of-process VST/CLAP host sidecar for Zeus\n"
         "\n"
         "USAGE:\n"
-        "  %s --shm-name <NAME> --control-pipe <PATH>\n"
+        "  %s --shm-name <SUFFIX> --control-pipe <PATH>\n"
         "  %s --idle\n"
         "\n"
         "REQUIRED ARGUMENTS:\n"
-        "  --shm-name      Shared-memory name prefix used for input + output\n"
-        "                  rings. The host appends '.in' and '.out'.\n"
-        "  --control-pipe  Path (Linux/macOS AF_UNIX) or pipe name (Windows)\n"
-        "                  for the control channel.\n"
+        "  --shm-name      Suffix for the host-created shm + sem names. The\n"
+        "                  sidecar appends '-h2s' and '-s2h' for the two ring\n"
+        "                  directions, plus '-sem' for the wakeup semaphores.\n"
+        "  --control-pipe  AF_UNIX socket path the host bound + listens on.\n"
         "\n"
         "OPTIONAL ARGUMENTS:\n"
         "  --idle          Test mode: no shm/control, heartbeat to stderr\n"
-        "                  (used by Zeus.PluginHost.Tests).\n"
+        "                  (used by Zeus.PluginHost.Tests Phase 1.5).\n"
         "\n"
-        "Phase 1: data-plane pass-through only. No plugin loading yet.\n"
-        "See docs/PHASE1.md.\n",
+        "Phase 2: cross-process pass-through round-trip. No plugin loading yet.\n"
+        "See docs/proposals/vst-host-phase2-wire.md.\n",
         argv0, argv0);
 }
 
@@ -146,6 +146,9 @@ int main(int argc, char** argv) {
 
     std::signal(SIGINT,  HandleStopSignal);
     std::signal(SIGTERM, HandleStopSignal);
+    // Don't crash if the control socket peer disappears mid-write; the
+    // send() returns -1/EPIPE and we exit cleanly.
+    std::signal(SIGPIPE, SIG_IGN);
 
     using namespace zeus::plughost;
 
@@ -154,20 +157,87 @@ int main(int argc, char** argv) {
         args.shmName.c_str(), args.controlPipe.c_str());
 
     try {
-        ShmRingMapping inputMapping(args.shmName + ".in",
-                                    kPhase1Frames, kPhase1Channels,
-                                    kPhase1SampleRate, kPhase1RingDepth);
-        ShmRingMapping outputMapping(args.shmName + ".out",
-                                     kPhase1Frames, kPhase1Channels,
-                                     kPhase1SampleRate, kPhase1RingDepth);
-
+        // 1. Connect to the control socket first. The host binds before
+        //    launching us, so we should connect within ~50 ms; the retry
+        //    loop tolerates up to 2 s of jitter.
         ControlPipe control;
-        if (!control.Open(args.controlPipe)) {
-            std::fprintf(stderr, "zeus-plughost: failed to open control pipe\n");
+        if (!control.Open(args.controlPipe, 2000)) {
+            std::fprintf(stderr,
+                "zeus-plughost: control socket connect failed (path=%s)\n",
+                args.controlPipe.c_str());
             return 2;
         }
 
-        Wakeup inputWakeup;
+        // 2. Open shm regions (host already created and ftruncated them).
+        const std::string h2sName = "/zeus-plughost-" + args.shmName + "-h2s";
+        const std::string s2hName = "/zeus-plughost-" + args.shmName + "-s2h";
+        ShmRingMapping inputMapping = ShmRingMapping::OpenExisting(
+            h2sName,
+            kPhase1Frames, kPhase1Channels, kPhase1SampleRate, kPhase1RingDepth);
+        ShmRingMapping outputMapping = ShmRingMapping::OpenExisting(
+            s2hName,
+            kPhase1Frames, kPhase1Channels, kPhase1SampleRate, kPhase1RingDepth);
+
+        // 3. Open the wakeup semaphores by name (host created them).
+        const std::string h2sSem = "/zeus-plughost-" + args.shmName + "-h2s-sem";
+        const std::string s2hSem = "/zeus-plughost-" + args.shmName + "-s2h-sem";
+        Wakeup inputWakeup(h2sSem, /*create=*/false);
+        Wakeup outputWakeup(s2hSem, /*create=*/false);
+
+        // 4. Send Hello and await HelloAck before entering the audio loop.
+        std::uint8_t helloPayload[16];
+        const std::uint32_t protoVer = 1;
+        const std::uint32_t sampleRate = kPhase1SampleRate;
+        const std::uint32_t framesPerBlock = kPhase1Frames;
+        const std::uint32_t channels = kPhase1Channels;
+        std::memcpy(helloPayload + 0,  &protoVer,       4);
+        std::memcpy(helloPayload + 4,  &sampleRate,     4);
+        std::memcpy(helloPayload + 8,  &framesPerBlock, 4);
+        std::memcpy(helloPayload + 12, &channels,       4);
+        if (!control.Send(ControlMessageTag::Hello, helloPayload, sizeof(helloPayload))) {
+            std::fprintf(stderr, "zeus-plughost: failed to send Hello\n");
+            return 3;
+        }
+
+        ControlMessageTag tag{};
+        std::vector<std::uint8_t> payload;
+        bool closed = false;
+        if (!control.Recv(tag, payload, /*timeoutMs=*/2000, closed) ||
+            tag != ControlMessageTag::HelloAck) {
+            std::fprintf(stderr,
+                "zeus-plughost: HelloAck handshake failed (closed=%d)\n",
+                closed ? 1 : 0);
+            return 3;
+        }
+        std::fprintf(stderr,
+            "zeus-plughost: handshake OK (proto=%u rate=%u frames=%u ch=%u)\n",
+            protoVer, sampleRate, framesPerBlock, channels);
+
+        // 5. Background control-read thread. Reads Goodbye / Heartbeat
+        //    messages while the audio thread runs the pass-through loop.
+        std::atomic<bool> stopFromControl{false};
+        std::thread controlReader([&]() {
+            while (!g_stopFlag && !stopFromControl.load(std::memory_order_relaxed)) {
+                ControlMessageTag t{};
+                std::vector<std::uint8_t> p;
+                bool isClosed = false;
+                bool ok = control.Recv(t, p, /*timeoutMs=*/200, isClosed);
+                if (!ok) {
+                    if (isClosed) {
+                        stopFromControl.store(true, std::memory_order_relaxed);
+                        return;
+                    }
+                    // timeout: loop and check stopFlag
+                    continue;
+                }
+                if (t == ControlMessageTag::Goodbye) {
+                    stopFromControl.store(true, std::memory_order_relaxed);
+                    return;
+                }
+                // Heartbeat or anything else: ignore silently in Phase 2.
+            }
+        });
+
         PassthroughStats stats;
 
         // Heartbeat thread: 1 Hz log of processed / dropped counters. Lives
@@ -175,35 +245,41 @@ int main(int argc, char** argv) {
         std::thread heartbeat([&]() {
             std::uint64_t lastProcessed = 0;
             std::uint64_t lastDropped   = 0;
-            while (!g_stopFlag) {
+            while (!g_stopFlag && !stopFromControl.load(std::memory_order_relaxed)) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
-                const std::uint64_t p = stats.processed.load(std::memory_order_relaxed);
-                const std::uint64_t d = stats.dropped.load(std::memory_order_relaxed);
+                const std::uint64_t pp = stats.processed.load(std::memory_order_relaxed);
+                const std::uint64_t dd = stats.dropped.load(std::memory_order_relaxed);
                 std::fprintf(stderr,
                     "zeus-plughost.heartbeat: processed=%llu (+%llu) dropped=%llu (+%llu)\n",
-                    static_cast<unsigned long long>(p),
-                    static_cast<unsigned long long>(p - lastProcessed),
-                    static_cast<unsigned long long>(d),
-                    static_cast<unsigned long long>(d - lastDropped));
-                lastProcessed = p;
-                lastDropped   = d;
+                    static_cast<unsigned long long>(pp),
+                    static_cast<unsigned long long>(pp - lastProcessed),
+                    static_cast<unsigned long long>(dd),
+                    static_cast<unsigned long long>(dd - lastDropped));
+                lastProcessed = pp;
+                lastDropped   = dd;
             }
         });
 
+        // The pass-through loop reads the input ring on the h2s wakeup,
+        // memcpys to the output slot, and posts on the s2h wakeup. The
+        // PassthroughStats counter increments per round-trip.
         RunPassthrough(inputMapping.Ring(),
                        outputMapping.Ring(),
                        inputWakeup,
+                       outputWakeup,
                        stats,
-                       g_stopFlag);
+                       g_stopFlag,
+                       stopFromControl);
 
-        if (heartbeat.joinable()) {
-            heartbeat.join();
-        }
+        if (heartbeat.joinable())     heartbeat.join();
+        if (controlReader.joinable()) controlReader.join();
 
         control.Close();
+        // Mappings + wakeups close via their dtors; we don't shm_unlink
+        // because the host owns the names.
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "zeus-plughost: fatal: %s\n", ex.what());
-        return 3;
+        return 4;
     }
 
     std::fprintf(stderr, "zeus-plughost: clean exit\n");

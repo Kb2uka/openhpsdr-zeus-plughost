@@ -7,21 +7,37 @@
 //
 // Per-platform impls:
 //
-//   - Linux : futex (linux/futex.h, syscall(SYS_futex, ...))
-//   - Win32 : CreateEventA + SetEvent / WaitForSingleObject
-//   - macOS : os_unfair_lock + dispatch_semaphore_t (or mach semaphore)
+//   - Linux : POSIX named semaphores (sem_open, sem_post, sem_timedwait).
+//   - macOS : same POSIX surface; libc.dylib.
+//   - Win32 : Phase 3 — named events.
 //
-// Phase 1 ships a working Linux impl; Win/Mac return ENOTIMPL but compile.
+// Phase 2 ships Linux + macOS via POSIX named semaphores so the host and
+// sidecar can share the wakeup edge across processes by name. The default
+// constructor builds an unnamed/local Wakeup retained for unit tests; the
+// cross-process constructor takes a leading-slash name.
 
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace zeus::plughost {
 
 class Wakeup {
 public:
+    // Default constructor — unnamed, process-local. Phase 2 uses this for
+    // backward-compatible tests that don't need cross-process visibility.
+    // On platforms where named semaphores are the ONLY supported impl
+    // (Linux/macOS), this falls back to a per-instance unnamed name
+    // generated from the address; callers that want cross-process visibility
+    // MUST use the named constructor below.
     Wakeup();
+
+    // Open or create a named POSIX semaphore. `name` must start with '/'.
+    // If `create` is true, the semaphore is created with O_CREAT. On
+    // Linux/macOS this maps to sem_open(name, O_CREAT, 0600, 0).
+    Wakeup(const std::string& name, bool create);
+
     ~Wakeup();
 
     Wakeup(const Wakeup&)            = delete;
@@ -35,17 +51,19 @@ public:
     // producer thread (Zeus side); the audio consumer side calls Wait().
     void Signal();
 
+    // True if this Wakeup owns the named primitive (i.e. created it with
+    // O_CREAT). Sidecar wakeups created via Wakeup(name, false) return
+    // false; they MUST NOT sem_unlink.
+    bool OwnsName() const { return ownsName_; }
+
+    const std::string& Name() const { return name_; }
+
 private:
-#if defined(ZEUS_PLUGHOST_OS_LINUX)
-    // Plain int futex word. Atomicity is enforced via std::atomic_ref-style
-    // syscall semantics (FUTEX_WAIT compares the word, FUTEX_WAKE is a
-    // pure wake). Kept as a raw int so we can pass &state_ to the syscall.
-    int state_ = 0;
-#elif defined(ZEUS_PLUGHOST_OS_WINDOWS)
-    void* event_ = nullptr;  // HANDLE; void* avoids dragging windows.h here
-#elif defined(ZEUS_PLUGHOST_OS_MACOS)
-    void* sem_ = nullptr;    // dispatch_semaphore_t opaque
-#endif
+    void OpenInternal(const std::string& name, bool create);
+
+    std::string name_;
+    void*       sem_ = nullptr;     // sem_t* on POSIX, HANDLE on Windows
+    bool        ownsName_ = false;
 };
 
 }  // namespace zeus::plughost

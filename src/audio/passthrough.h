@@ -1,4 +1,4 @@
-// passthrough.h — Phase 1 data-plane entry point.
+// passthrough.h — Phase 2 data-plane entry point.
 
 #pragma once
 
@@ -17,12 +17,16 @@ struct PassthroughStats {
     std::atomic<std::uint64_t> dropped{0};
 };
 
-// Phase 1 audio loop: read input, memcpy into output, repeat. Returns when
-// `stopFlag` becomes true. Caller owns rings and wakeup.
-void RunPassthrough(ShmRing&          inputRing,
-                    ShmRing&          outputRing,
-                    Wakeup&           inputWakeup,
-                    PassthroughStats& stats,
-                    const volatile bool& stopFlag);
+// Phase 2 audio loop: wait for an input block on `inputWakeup`, copy
+// payload to the output ring, post `outputWakeup` so the host wakes.
+// Returns when either `stopFlag` (signal-driven) or `controlStopFlag`
+// (Goodbye / EOF) becomes true.
+void RunPassthrough(ShmRing&                    inputRing,
+                    ShmRing&                    outputRing,
+                    Wakeup&                     inputWakeup,
+                    Wakeup&                     outputWakeup,
+                    PassthroughStats&           stats,
+                    const volatile bool&        stopFlag,
+                    const std::atomic<bool>&    controlStopFlag);
 
 }  // namespace zeus::plughost
