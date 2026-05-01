@@ -32,14 +32,21 @@
 #include "vst3/sdk_includes.h"
 
 #include "pluginterfaces/gui/iplugview.h"
+#include "pluginterfaces/vst/ivstprocesscontext.h"
+#include "public.sdk/source/vst/hosting/parameterchanges.h"
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <new>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -57,16 +64,236 @@ using Steinberg::FUID;
 using Steinberg::Vst::HostApplication;
 using Steinberg::Vst::IAudioProcessor;
 using Steinberg::Vst::IComponent;
+using Steinberg::Vst::IComponentHandler;
 using Steinberg::Vst::IConnectionPoint;
 using Steinberg::Vst::IEditController;
 using Steinberg::Vst::ParameterInfo;
 using Steinberg::Vst::ParamID;
+using Steinberg::Vst::ParamValue;
 using Steinberg::Vst::ProcessData;
 using Steinberg::Vst::ProcessSetup;
 using Steinberg::Vst::AudioBusBuffers;
 using Steinberg::Vst::SpeakerArrangement;
 using Steinberg::Vst::SymbolicSampleSizes;
 using Steinberg::Vst::ProcessModes;
+
+// Minimal IComponentHandler — captures performEdit and forwards to the
+// host-supplied callback. beginEdit / endEdit are no-ops (they bracket the
+// performEdit calls during a knob drag; we only care about the value
+// transitions). restartComponent is also a no-op for now — it's the
+// "params reloaded, host should re-read everything" notification, which
+// our control-thread ListParams refresh handles on demand.
+//
+// Lifetime: lives inside ActivePlugin, owned by IPtr. The plugin's
+// controller holds a refcount to it; we drop our reference on Unload after
+// the controller is torn down.
+class HostComponentHandler : public IComponentHandler {
+public:
+    // Callback for the audio-side pending-changes queue. performEdit
+    // pushes (paramId, value) here so the next process() call delivers
+    // them via inputParameterChanges to two-class plugins like ZamVerb
+    // whose audio processor only learns about edits through that channel.
+    using AudioQueuePush = std::function<void(
+        std::uint32_t paramId, double normalizedValue)>;
+
+    HostComponentHandler(PluginHost::ParamChangedCallback* cb,
+                         AudioQueuePush                    audioQueuePush)
+        : cb_(cb), audioQueuePush_(std::move(audioQueuePush)) {
+        // Spin up the drain thread immediately. The plugin's editor calls
+        // performEdit on the GUI thread; if we did the socket I/O there
+        // any contention on the control-send mutex (or a full kernel send
+        // buffer) would block the editor's repaint loop. Hard freeze, no
+        // X-button response. The drain thread takes all that risk away
+        // from the GUI thread.
+        drainThread_ = std::thread([this]() { DrainLoop(); });
+    }
+
+    virtual ~HostComponentHandler() {
+        // Stop the drain thread before any other teardown so it can't
+        // deref cb_ during destruction. Notify wakes a possibly-sleeping
+        // drain; the thread joins after it finishes any in-flight cb_ call.
+        // (FUnknown's dtor is non-virtual by COM convention; we make ours
+        // virtual so `delete this` from release() invokes the right one.)
+        stopRequested_.store(true, std::memory_order_release);
+        queueCv_.notify_all();
+        if (drainThread_.joinable()) {
+            drainThread_.join();
+        }
+    }
+
+    // Coalesce window per paramId. Many plugins fire performEdit at the
+    // editor's repaint rate (60–1000 Hz); each one in Wave 7's first cut
+    // turned into a control-pipe frame, saturating the .NET dispatcher
+    // and back-pressuring the editor's UI thread. With this filter, a
+    // fast knob drag generates at most ~100 frames/sec/param while still
+    // catching every distinct value (the time gate) and never losing the
+    // final resting value (last-write wins on the trailing fire after
+    // the gate window). Persistence ScheduleSave is debounced 250 ms so
+    // there's no operator-perceivable cost.
+    static constexpr std::int64_t kCoalesceMinNs = 10'000'000;  // 10 ms
+
+    // FUnknown contract.
+    Steinberg::tresult PLUGIN_API queryInterface(
+            const Steinberg::TUID iid, void** obj) override {
+        if (Steinberg::FUnknownPrivate::iidEqual(iid, IComponentHandler::iid) ||
+            Steinberg::FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
+            *obj = static_cast<IComponentHandler*>(this);
+            addRef();
+            return kResultOk;
+        }
+        *obj = nullptr;
+        return Steinberg::kNoInterface;
+    }
+    Steinberg::uint32 PLUGIN_API addRef()  override { return ++refCount_; }
+    Steinberg::uint32 PLUGIN_API release() override {
+        Steinberg::uint32 r = --refCount_;
+        if (r == 0) delete this;
+        return r;
+    }
+
+    // IComponentHandler contract.
+    Steinberg::tresult PLUGIN_API beginEdit(ParamID /*id*/) override {
+        return kResultOk;
+    }
+    Steinberg::tresult PLUGIN_API performEdit(
+            ParamID id, ParamValue valueNormalized) override {
+        // Coalesce: if the same paramId fired within the gate window with
+        // a value that didn't change meaningfully, swallow it inline. This
+        // is just a hint to keep the queue small; the queue itself is
+        // already bounded so the drain thread can keep up. Important: do
+        // NOT call cb_ here — that touches the control socket and would
+        // freeze the editor's GUI thread if the socket back-pressures.
+        const auto nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        {
+            std::lock_guard<std::mutex> lk(coalesceMutex_);
+            auto it = lastFires_.find(id);
+            if (it != lastFires_.end()) {
+                const auto deltaNs = nowNs - it->second.nsTime;
+                const auto deltaVal = std::fabs(valueNormalized - it->second.value);
+                if (deltaNs < kCoalesceMinNs && deltaVal < 0.001) {
+                    it->second.value = valueNormalized;
+                    return kResultOk;
+                }
+                it->second.nsTime = nowNs;
+                it->second.value = valueNormalized;
+            } else {
+                lastFires_.emplace(id, FireRecord{nowNs, valueNormalized});
+            }
+        }
+
+        // Push to the audio-side pending queue FIRST so the audio thread
+        // sees the change on its next process() call. Two-class plugins
+        // (ZamVerb etc.) only learn about edits through inputParameterChanges
+        // — without this push, the audio stays at initial defaults no matter
+        // how the operator moves the knob. Single-component plugins (ZamEQ2)
+        // also see the change here, harmlessly. The lambda holds a raw
+        // pointer to the ActivePlugin's mutex+deque; lifetime is bounded
+        // by the handler's IPtr (destroyed before the ActivePlugin itself).
+        if (audioQueuePush_) {
+            audioQueuePush_(static_cast<std::uint32_t>(id),
+                            static_cast<double>(valueNormalized));
+        }
+
+        // Enqueue and signal the IPC drain thread for host-side persistence.
+        // The drain does the socket I/O. With a bounded queue we drop the
+        // OLDEST entry on overflow (last-write-wins semantics; the operator's
+        // final knob position is preserved). Caps memory in pathological
+        // floods even if the drain can't keep up momentarily.
+        {
+            std::lock_guard<std::mutex> lk(queueMutex_);
+            if (queue_.size() >= kQueueCap) {
+                queue_.pop_front();
+                ++droppedCount_;
+            }
+            queue_.push_back(QueuedFire{id, valueNormalized});
+        }
+        queueCv_.notify_one();
+        return kResultOk;
+    }
+    Steinberg::tresult PLUGIN_API endEdit(ParamID /*id*/) override {
+        return kResultOk;
+    }
+    Steinberg::tresult PLUGIN_API restartComponent(Steinberg::int32 /*flags*/) override {
+        // A more thorough host would re-pull parameter info / state on
+        // certain flags; for our persistence-bridge purposes the next
+        // ListParams call refreshes the cache.
+        return kResultOk;
+    }
+
+private:
+    struct FireRecord {
+        std::int64_t nsTime;
+        double       value;
+    };
+
+    struct QueuedFire {
+        std::uint32_t paramId;
+        double        value;
+    };
+
+    // Drain thread: blocks on queueCv_, dispatches fires through cb_. All
+    // socket I/O happens here; the GUI thread only enqueues. On stop we
+    // dispatch remaining queued fires (best-effort persistence) before
+    // joining so the operator's final knob positions land in the host's
+    // ChainSlot.Parameters cache → LiteDB save.
+    void DrainLoop() {
+        for (;;) {
+            QueuedFire fire;
+            {
+                std::unique_lock<std::mutex> lk(queueMutex_);
+                queueCv_.wait(lk, [this]() {
+                    return stopRequested_.load(std::memory_order_acquire)
+                        || !queue_.empty();
+                });
+                if (queue_.empty()) {
+                    if (stopRequested_.load(std::memory_order_acquire)) {
+                        return;
+                    }
+                    continue;
+                }
+                fire = queue_.front();
+                queue_.pop_front();
+            }
+            // Dispatch outside the lock so a slow socket write doesn't
+            // block enqueuers (the GUI thread). cb_ may be null if the
+            // PluginHost hasn't installed a callback yet — drop silently.
+            if (cb_ && *cb_) {
+                (*cb_)(fire.paramId, fire.value);
+            }
+        }
+    }
+
+    // Bounded queue cap. At ~100 fires/sec/param post-coalesce and a typical
+    // ~10 simultaneous-knob limit, peak inflight is ~1000/sec. Cap at 2048
+    // gives ~2s of buffer at the worst sustained rate before dropping —
+    // plenty for the C# dispatcher to catch up. Drops are last-write-wins.
+    static constexpr std::size_t kQueueCap = 2048;
+
+    std::atomic<Steinberg::uint32>            refCount_{1};
+    // Pointer to the PluginHost's installed callback. We don't own the
+    // function; the PluginHost holds it. Null-checked at every fire.
+    PluginHost::ParamChangedCallback*         cb_;
+    // Audio-side queue push. Captures a pointer to the ActivePlugin's
+    // pending-changes deque + mutex; called inline from performEdit (after
+    // coalesce) on the GUI thread. The lock is brief — contention is at
+    // most one process() block.
+    AudioQueuePush                            audioQueuePush_;
+
+    // Coalesce filter — first line of defence; reduces queue traffic.
+    std::mutex                                coalesceMutex_;
+    std::unordered_map<std::uint32_t, FireRecord> lastFires_;
+
+    // Drain queue — second line of defence; isolates GUI thread from I/O.
+    std::mutex                                queueMutex_;
+    std::condition_variable                   queueCv_;
+    std::deque<QueuedFire>                    queue_;
+    std::atomic<bool>                         stopRequested_{false};
+    std::thread                               drainThread_;
+    // Diagnostic — number of queue overflow drops. Reset never; useful
+    // for `wdsp.psSeed`-style health logging if we wire it later.
+    std::uint64_t                             droppedCount_{0};
+};
 
 // One fully-initialized + activated plugin. Allocated on the control
 // thread, published into PluginHost::Impl::active_ via release-store, and
@@ -81,6 +308,34 @@ struct ActivePlugin {
     IPtr<IConnectionPoint>     componentCp;
     IPtr<IConnectionPoint>     controllerCp;
     IPtr<Steinberg::IPlugView> editorView;     // null until AcquireEditorView
+    IPtr<HostComponentHandler> componentHandler;  // null until set on controller
+    // Wave 7 — re-used across Process() calls so we don't allocate on the
+    // audio thread. clearQueue() resets them at the start of each block.
+    Steinberg::Vst::ParameterChanges inputParameterChanges;
+    Steinberg::Vst::ParameterChanges outputParameterChanges;
+    // Monotonic project-time sample counter. Plugins that animate on
+    // transport time use this; we just increment by frames each block so
+    // it advances in step with audio. Wraps after ~6 million years at 48k.
+    Steinberg::int64           projectTimeSamples = 0;
+
+    // Wave 7 — pending parameter changes from the editor (performEdit) and
+    // host control-thread SetParam. The audio thread try_locks at the start
+    // of each Process() and drains into inputParameterChanges so the audio
+    // processor sees them on the next block. Two-class plugins (separate
+    // IComponent + IEditController, e.g. ZamVerb) need this — without it
+    // the controller cache updates but the audio processor never sees the
+    // change, so the audio stays at initial defaults regardless of UI
+    // movement. Single-component plugins like ZamEQ2 work either way
+    // (component IS the controller) but routing all changes through here
+    // is the canonical VST3 path and harmless for them too.
+    struct PendingChange {
+        Steinberg::Vst::ParamID    id;
+        Steinberg::Vst::ParamValue value;
+    };
+    std::mutex                pendingMutex;
+    std::deque<PendingChange> pendingChanges;
+    static constexpr std::size_t kPendingCap = 256;
+
     LoadInfo                   info;
     std::int32_t               maxBlockSize;
     double                     sampleRate;
@@ -312,6 +567,13 @@ void TearDownActive(ActivePlugin* a) noexcept {
     }
     a->componentCp  = nullptr;
     a->controllerCp = nullptr;
+    // Detach our IComponentHandler before tearing the controller down so
+    // any final performEdit the plugin tries to fire during terminate
+    // doesn't reach into our dangling state.
+    if (a->controller && a->componentHandler) {
+        a->controller->setComponentHandler(nullptr);
+    }
+    a->componentHandler = nullptr;
     if (a->controller && !a->singleComponent) {
         a->controller->terminate();
     }
@@ -353,6 +615,17 @@ struct PluginHost::Impl {
     // Snapshot of the most recent successful load info, returned by
     // CurrentInfo(). Updated under controlMutex.
     LoadInfo currentInfo;
+
+    // Wave 7 — host-supplied callback for IComponentHandler::performEdit.
+    // Lives on the PluginHost (not the per-plugin ActivePlugin) so it
+    // survives Load/Unload cycles. The HostComponentHandler installed on
+    // each loaded controller holds a pointer to this slot and reads it on
+    // every performEdit. Updated only via SetParamChangedCallback under
+    // controlMutex, so there's no concurrent-write race; reads from the
+    // handler happen on whatever thread the plugin called performEdit on
+    // (no lock — std::function copy is not threadsafe, but updates only
+    // happen at deterministic points outside the audio thread).
+    PluginHost::ParamChangedCallback paramChangedCallback;
 
     Impl() {
         host = std::make_unique<HostApplication>();
@@ -422,6 +695,34 @@ LoadResult PluginHost::Load(const std::string& path,
     }
     LoadInfo info = fresh->info;
 
+    // 4a. Wave 7 — install our IComponentHandler on the controller so the
+    //     plugin can publish edit-driven parameter changes back to us. The
+    //     handler holds a pointer to impl_->paramChangedCallback (a
+    //     std::function slot owned by Impl); it dereferences on every fire.
+    //     Best-effort — controllers without setComponentHandler support
+    //     are rare but legal; meters from those plugins won't round-trip
+    //     and edit-driven persistence won't see their knob changes, but
+    //     the audio path is unaffected.
+    //
+    //     The audio-queue lambda captures fresh.get() so the audio thread
+    //     can drain pending changes into inputParameterChanges before
+    //     each process() call. Lifetime: the handler is owned by an IPtr
+    //     in fresh->componentHandler, destroyed before fresh itself, so
+    //     the captured pointer is always valid while the handler can fire.
+    if (fresh->controller) {
+        ActivePlugin* activePtr = fresh.get();
+        auto audioPush = [activePtr](std::uint32_t paramId, double value) {
+            std::lock_guard<std::mutex> lk(activePtr->pendingMutex);
+            if (activePtr->pendingChanges.size() >= ActivePlugin::kPendingCap) {
+                activePtr->pendingChanges.pop_front();
+            }
+            activePtr->pendingChanges.push_back({paramId, value});
+        };
+        fresh->componentHandler = Steinberg::owned(
+            new HostComponentHandler(&impl_->paramChangedCallback, audioPush));
+        fresh->controller->setComponentHandler(fresh->componentHandler.get());
+    }
+
     // 5. Swap the active slot. Take the prior pointer with acquire so we
     //    are guaranteed to see whatever the audio thread last published.
     ActivePlugin* prior = impl_->active.exchange(
@@ -453,6 +754,18 @@ void PluginHost::Unload() {
 
 bool PluginHost::IsLoaded() const noexcept {
     return impl_->active.load(std::memory_order_acquire) != nullptr;
+}
+
+void PluginHost::SetParamChangedCallback(ParamChangedCallback cb) {
+    // Update under the control mutex so the assignment is serialized vs
+    // Load (which calls setComponentHandler with a pointer to this slot).
+    // The handler reads via a std::function copy on the calling thread —
+    // we accept the small race window where a performEdit fires during
+    // assignment; std::function assignment from non-empty to non-empty is
+    // not atomic but a torn read just means one missed event, which is
+    // acceptable for a debounced-save persistence pathway.
+    std::lock_guard<std::mutex> guard(impl_->controlMutex);
+    impl_->paramChangedCallback = std::move(cb);
 }
 
 LoadInfo PluginHost::CurrentInfo() const {
@@ -487,6 +800,21 @@ bool PluginHost::Process(const float* in, float* out, std::int32_t frames) noexc
     outputs.silenceFlags     = 0;
     outputs.channelBuffers32 = &out;
 
+    // Wave 7 — populate a minimal ProcessContext so plugins that gate
+    // metering / animation on transport state see "playing" with a valid
+    // sample rate. Per VST3 spec the host must supply at least sampleRate
+    // and (when kPlaying is set) projectTimeSamples. systemTime is marked
+    // valid because some plugins use it for envelope reseeds. Stack-
+    // allocated each call — ProcessContext is ~140 bytes, trivial.
+    Steinberg::Vst::ProcessContext ctx;
+    std::memset(&ctx, 0, sizeof(ctx));
+    ctx.state = static_cast<Steinberg::uint32>(
+        Steinberg::Vst::ProcessContext::kPlaying |
+        Steinberg::Vst::ProcessContext::kSystemTimeValid);
+    ctx.sampleRate         = a->sampleRate;
+    ctx.projectTimeSamples = a->projectTimeSamples;
+    a->projectTimeSamples += frames;
+
     ProcessData data;
     data.processMode         = static_cast<Steinberg::int32>(ProcessModes::kRealtime);
     data.symbolicSampleSize  = static_cast<Steinberg::int32>(SymbolicSampleSizes::kSample32);
@@ -495,11 +823,42 @@ bool PluginHost::Process(const float* in, float* out, std::int32_t frames) noexc
     data.numOutputs          = 1;
     data.inputs              = &inputs;
     data.outputs             = &outputs;
-    data.inputParameterChanges  = nullptr;
-    data.outputParameterChanges = nullptr;
+    // Pass real ParameterChanges objects so plugins that emit meter values
+    // through outputParameterChanges (and plugins that expect non-null
+    // input change lists) don't deref nullptr. Both objects live on the
+    // ActivePlugin so they're allocated once per plugin, not per block.
+    a->inputParameterChanges.clearQueue();
+    a->outputParameterChanges.clearQueue();
+
+    // Drain the pending parameter-change queue (populated by the editor's
+    // performEdit and host-side SetParam). For two-class plugins like
+    // ZamVerb, the audio processor only learns about parameter updates
+    // through this channel — without the drain, knob movement updates the
+    // controller's cache but the audio stays at initial defaults. We
+    // try_lock to keep this real-time-safe; if a writer is mid-push, the
+    // changes wait one block (21 ms at 48 kHz, imperceptible). Each change
+    // becomes a 1-point queue at sampleOffset=0 so the plugin sees it
+    // applied at the start of the block.
+    if (a->pendingMutex.try_lock()) {
+        if (!a->pendingChanges.empty()) {
+            for (const auto& pc : a->pendingChanges) {
+                Steinberg::int32 paramIndex = 0;
+                auto* queue = a->inputParameterChanges.addParameterData(
+                    pc.id, paramIndex);
+                if (queue != nullptr) {
+                    Steinberg::int32 pointIndex = 0;
+                    queue->addPoint(0, pc.value, pointIndex);
+                }
+            }
+            a->pendingChanges.clear();
+        }
+        a->pendingMutex.unlock();
+    }
+    data.inputParameterChanges  = &a->inputParameterChanges;
+    data.outputParameterChanges = &a->outputParameterChanges;
     data.inputEvents            = nullptr;
     data.outputEvents           = nullptr;
-    data.processContext         = nullptr;
+    data.processContext         = &ctx;
 
     tresult tr = a->processor->process(data);
     if (tr != kResultOk && tr != kResultTrue) {
@@ -569,6 +928,19 @@ double PluginHost::SetParam(std::uint32_t paramId, double normalized) {
     if (normalized < 0.0) normalized = 0.0;
     if (normalized > 1.0) normalized = 1.0;
     a->controller->setParamNormalized(static_cast<ParamID>(paramId), normalized);
+    // Push to the audio-side pending queue so two-class plugins (ZamVerb
+    // etc.) see the change at the next process() block. setParamNormalized
+    // alone updates the controller's cache; for plugins where the audio
+    // processor is a separate object, the canonical VST3 path is via
+    // inputParameterChanges. Single-component plugins (ZamEQ2) get the
+    // change either way — push here too for consistency.
+    {
+        std::lock_guard<std::mutex> lk(a->pendingMutex);
+        if (a->pendingChanges.size() >= ActivePlugin::kPendingCap) {
+            a->pendingChanges.pop_front();
+        }
+        a->pendingChanges.push_back({static_cast<ParamID>(paramId), normalized});
+    }
     // Read back what the plugin actually accepted (post quantise / clamp).
     return a->controller->getParamNormalized(static_cast<ParamID>(paramId));
 }

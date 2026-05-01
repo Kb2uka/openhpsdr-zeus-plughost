@@ -104,7 +104,8 @@ void GuiThread::SetAsyncCallback(AsyncCallback cb) {
 }
 
 GuiThread::ShowResult GuiThread::RequestShow(
-    int slotIdx, Steinberg::IPlugView* view, const std::string& title) {
+    int slotIdx, Steinberg::IPlugView* view,
+    IEditorIdlePump* idlePump, const std::string& title) {
     ShowResult result{false, 7, 0, 0};
     if (!running_.load(std::memory_order_acquire)) {
         return result;
@@ -122,6 +123,7 @@ GuiThread::ShowResult GuiThread::RequestShow(
     req.kind        = RequestKind::Show;
     req.slotIdx     = slotIdx;
     req.view        = view;
+    req.idlePump    = idlePump;
     req.title       = title;
     req.replyMutex  = &m;
     req.replyCv     = &cv;
@@ -195,6 +197,13 @@ void GuiThread::ThreadMain() {
 
         // 2. Process X events that have already arrived.
         DispatchPendingXEvents();
+
+        // 2b. Tick any per-editor main-thread idle hooks. No-op for VST3
+        //     IPlugViews; non-zero for VST2 / CLAP wrappers that need
+        //     periodic main-thread time (effEditIdle, on_main_thread).
+        for (int i = 0; i < kMaxSlots; ++i) {
+            if (windows_[i]) windows_[i]->OnIdleTick();
+        }
 
         // 3. Tick timers + compute next-fire deadline.
         const std::uint64_t nextMs =
@@ -326,7 +335,7 @@ void GuiThread::HandleShow(const Request& req) {
     auto win = std::make_unique<EditorWindow>(
         display_, req.slotIdx, req.title, runLoop_.get());
     std::uint8_t status = 5;
-    bool ok = win->Attach(req.view, status);
+    bool ok = win->Attach(req.view, req.idlePump, status);
     if (!ok) {
         signalReply(ShowResult{false, status, 0, 0});
         return;

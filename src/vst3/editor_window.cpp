@@ -1,6 +1,7 @@
 // editor_window.cpp — one top-level X11 window hosting one IPlugView.
 
 #include "vst3/editor_window.h"
+#include "vst3/editor_idle_pump.h"
 #include "vst3/host_plug_frame.h"
 #include "vst3/host_run_loop.h"
 
@@ -28,7 +29,8 @@ EditorWindow::~EditorWindow() {
     Detach();
 }
 
-bool EditorWindow::Attach(IPlugView* view, std::uint8_t& outStatus) {
+bool EditorWindow::Attach(IPlugView* view, IEditorIdlePump* idlePump,
+                          std::uint8_t& outStatus) {
     if (view == nullptr) {
         outStatus = 5;
         return false;
@@ -38,6 +40,7 @@ bool EditorWindow::Attach(IPlugView* view, std::uint8_t& outStatus) {
         outStatus = 0;
         return true;
     }
+    idlePump_ = idlePump;
     if (display_ == nullptr) {
         outStatus = 7;
         return false;
@@ -183,6 +186,7 @@ void EditorWindow::Detach() {
         view_->setFrame(nullptr);
         view_->removed();
     }
+    idlePump_ = nullptr;
     view_.reset();
 
     if (display_ != nullptr && window_ != 0) {
@@ -235,6 +239,11 @@ bool EditorWindow::OnEvent(const XEvent& ev) {
 void EditorWindow::OnResized(int newW, int newH) {
     if (newW > 0) width_  = newW;
     if (newH > 0) height_ = newH;
+}
+
+void EditorWindow::OnIdleTick() {
+    if (!attached_ || idlePump_ == nullptr) return;
+    idlePump_->Idle();
 }
 
 }  // namespace zeus::plughost::vst3

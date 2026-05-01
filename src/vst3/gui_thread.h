@@ -50,6 +50,7 @@ namespace zeus::plughost::vst3 {
 class EditorWindow;
 class HostRunLoop;
 class PluginChain;
+class IEditorIdlePump;
 
 class GuiThread {
 public:
@@ -93,9 +94,13 @@ public:
     // ownership of the view via the EditorWindow's IPtr. If an editor is
     // already open for this slot, we return ok with the current size.
     //
+    // `idlePump` is optional and non-null only for VST2 / CLAP wrappers
+    // that need a periodic main-thread tick. VST3 callers pass nullptr.
+    //
     // Synchronous up to `timeout`. Returns status 7 if the GUI thread
     // hasn't been started yet (caller's responsibility to Start first).
     ShowResult RequestShow(int slotIdx, Steinberg::IPlugView* view,
+                           IEditorIdlePump* idlePump,
                            const std::string& title);
 
     // Hide the editor for `slotIdx`. Returns true if an editor was open
@@ -111,6 +116,7 @@ private:
         RequestKind                          kind;
         int                                  slotIdx{-1};
         Steinberg::IPlugView*                view{nullptr};
+        IEditorIdlePump*                     idlePump{nullptr};
         std::string                          title;
 
         // Reply machinery — caller waits on the same condvar.

@@ -35,6 +35,7 @@ namespace zeus::plughost::vst3 {
 
 class HostRunLoop;
 class HostPlugFrame;
+class IEditorIdlePump;
 
 class EditorWindow {
 public:
@@ -52,7 +53,15 @@ public:
     //
     // The view's refcount is bumped by the caller before passing it in;
     // EditorWindow keeps a private IPtr until Detach().
-    bool Attach(Steinberg::IPlugView* view, std::uint8_t& outStatus);
+    //
+    // `idlePump` is optional. Non-null only for VST2 / CLAP wrappers
+    // that need a periodic main-thread tick (effEditIdle / on_main_thread).
+    // VST3 plugins drive themselves via IRunLoop and pass nullptr — we
+    // never touch their view through any side-channel, so no chance of
+    // a cross-DSO RTTI crash.
+    bool Attach(Steinberg::IPlugView* view,
+                IEditorIdlePump* idlePump,
+                std::uint8_t& outStatus);
 
     // Idempotent. Calls view->removed and XDestroyWindow.
     void Detach();
@@ -73,6 +82,12 @@ public:
     // ResizeCallback target).
     void OnResized(int newW, int newH);
 
+    // Periodic main-thread tick. Called only from the GUI thread.
+    // No-op when `idlePump_` is null (VST3 path); for VST2 / CLAP this
+    // forwards to the wrapper's Idle() so the plugin can repaint or
+    // drain main-thread work.
+    void OnIdleTick();
+
 private:
     Display*                            display_;
     int                                 slotIdx_;
@@ -80,6 +95,7 @@ private:
     HostRunLoop*                        runLoop_;
 
     Steinberg::IPtr<Steinberg::IPlugView> view_;
+    IEditorIdlePump*                    idlePump_{nullptr};
     std::unique_ptr<HostPlugFrame>      plugFrame_;
     ::Window                            window_{0};
     Atom                                wmDeleteWindow_{None};

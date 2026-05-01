@@ -32,6 +32,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -155,6 +156,24 @@ public:
 
     // Drop the editor view (idempotent).
     void ReleaseEditorView();
+
+    // Wave 7: install a callback for IComponentHandler::performEdit. The
+    // sidecar wraps a HostComponentHandler around the controller after
+    // Load(); on every edit the controller (or its editor) reports, the
+    // callback fires with (paramId, normalizedValue). Caller (PluginChain)
+    // typically wraps it with the slot index and forwards to main.cpp's
+    // ParamChanged frame sender.
+    //
+    // Set ONCE per PluginHost instance — installed callbacks survive Load
+    // / Unload cycles. Setting null disconnects.
+    //
+    // Threading: performEdit can fire from the editor thread (X11), the
+    // audio thread, or other internal plugin threads. The callback MUST be
+    // thread-safe and SHOULD be non-blocking; sendFrame's mutex is fine
+    // (microsecond contention) but heavier work should hop threads.
+    using ParamChangedCallback = std::function<void(
+        std::uint32_t paramId, double normalizedValue)>;
+    void SetParamChangedCallback(ParamChangedCallback cb);
 
 private:
     struct Impl;

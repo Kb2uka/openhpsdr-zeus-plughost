@@ -35,6 +35,12 @@ set(ZEUS_PLUGHOST_SOURCES
     src/audio/passthrough.cpp
     src/vst3/plugin_host.cpp
     src/vst3/plugin_chain.cpp
+    # Phase 5a — Linux VST 2.4 host (Vestige header, MIT-equivalent).
+    src/vst2/vst2_plugin.cpp
+    src/vst2/vst2_view.cpp
+    # Phase 6 — CLAP host (MIT headers from free-audio/clap submodule).
+    src/clap/clap_plugin.cpp
+    src/clap/clap_view.cpp
     # Platform-specific Module loader from the VST 3 SDK. Defined by
     # cmake/deps.cmake based on the host triple; we compile it directly
     # into our binary so the SDK's example target tree stays disabled.
@@ -69,6 +75,8 @@ add_executable(zeus-plughost ${ZEUS_PLUGHOST_SOURCES})
 target_include_directories(zeus-plughost PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/vst3sdk
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/vestige
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/clap/include
 )
 
 # Warnings-as-errors: GCC/Clang on Linux/Mac, MSVC on Windows. SDK headers

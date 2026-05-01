@@ -41,6 +41,7 @@
 #if defined(__linux__) && !defined(__APPLE__)
 #  define ZEUS_PLUGHOST_HAS_GUI 1
 #  include "vst3/gui_thread.h"
+#  include "vst3/editor_idle_pump.h"
 #  include "pluginterfaces/gui/iplugview.h"
 #else
 #  define ZEUS_PLUGHOST_HAS_GUI 0
@@ -250,6 +251,16 @@ int main(int argc, char** argv) {
             std::lock_guard<std::mutex> lk(controlSendMutex);
             return control.Send(tag, data, size);
         };
+        // Non-blocking variant for lossy events. Drops if the socket's
+        // send queue would block — used for ParamChanged at editor-knob
+        // rates, where the .NET reader can't keep up and a blocking write
+        // would freeze the plugin's GUI thread (rack-observed: VST2 ZAM
+        // plugins fire automate per pixel of slider drag).
+        auto trySendFrameLossy = [&](ControlMessageTag tag,
+                                     const std::uint8_t* data, std::size_t size) {
+            std::lock_guard<std::mutex> lk(controlSendMutex);
+            return control.TrySendNonBlocking(tag, data, size);
+        };
 
         // ---- helpers: little-endian byte appenders ----
         auto appendU8 = [](std::vector<std::uint8_t>& body, std::uint8_t v) {
@@ -444,6 +455,41 @@ int main(int argc, char** argv) {
             sendFrame(ControlMessageTag::EditorResized,
                       body.data(), body.size());
         };
+
+        // Wave 7 — ParamChanged async sender. Wire format: u8 slot + u32 paramId
+        // + f64 normalizedValue (13 bytes). Fires from any thread the plugin
+        // calls performEdit on (typically the editor / GUI thread, but plugins
+        // are permitted to fire from audio threads too — sendFrame mutex
+        // serialises and the worst case is microsecond contention).
+        auto sendParamChanged = [&](std::uint8_t slot, std::uint32_t paramId,
+                                    double normalizedValue) {
+            std::vector<std::uint8_t> body;
+            body.reserve(13);
+            body.push_back(slot);
+            appendU32Le(body, paramId);
+            appendF64Le(body, normalizedValue);
+            // Lossy: drop on socket back-pressure. Latest-wins semantics
+            // is correct for slider drags — the .NET host will get the
+            // newer value on the next un-throttled tick. The previous
+            // blocking-Send path stalled the plugin's GUI thread when
+            // the .NET reader briefly fell behind, freezing the editor.
+            trySendFrameLossy(ControlMessageTag::ParamChanged,
+                              body.data(), body.size());
+        };
+
+        // Wave 7 — chain-level performEdit bridge. Every editor knob drag
+        // (and every internal automation event) lands here as
+        // (slot, paramId, normalizedValue). We just serialise into a
+        // ParamChanged frame; the host (.NET) updates ChainSlot.Parameters
+        // and debounce-saves to LiteDB. Bound here rather than inside the
+        // chain so per-slot wrappers reuse the same sendParamChanged
+        // closure without a heap-alloc per fire.
+        pluginChain.SetParamChangedCallback(
+            [&](int slotIdx, std::uint32_t paramId, double normalizedValue) {
+                if (slotIdx < 0 || slotIdx > 0xFF) return;
+                sendParamChanged(static_cast<std::uint8_t>(slotIdx),
+                                 paramId, normalizedValue);
+            });
 
 #if ZEUS_PLUGHOST_HAS_GUI
         // The GUI thread will call this from its own thread when the
@@ -690,13 +736,17 @@ int main(int argc, char** argv) {
                         sendSlotShowEditorResult(slot, 2, 0, 0);
                         continue;
                     }
+                    // Companion idle pump for VST2 / CLAP wrappers; null
+                    // for VST3 (those drive themselves via IRunLoop).
+                    vst3::IEditorIdlePump* idlePump =
+                        pluginChain.AcquireEditorIdlePump(static_cast<int>(slot));
                     // Use the loaded plugin's display name as the title.
                     // (PluginChain doesn't expose an info getter; use a
                     // generic fallback. Future polish: surface name via
                     // CurrentInfo on slot.)
                     std::string title = "Plugin Editor — slot " + std::to_string(slot);
                     auto rsp = guiThread.RequestShow(
-                        static_cast<int>(slot), view, title);
+                        static_cast<int>(slot), view, idlePump, title);
                     if (!rsp.ok) {
                         // Drop our ref; on next show we'll createView again.
                         pluginChain.ReleaseEditorView(static_cast<int>(slot));

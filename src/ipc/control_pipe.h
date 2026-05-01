@@ -39,6 +39,15 @@
 //   0x33 SlotHideEditorResult sidecar -> host (u8 slot + u8 status)
 //   0x34 EditorClosed         sidecar -> host ASYNC (u8 slot)
 //   0x35 EditorResized        sidecar -> host ASYNC (u8 slot + u32 w + u32 h)
+//
+// Editor-driven parameter changes (Wave 7 — IComponentHandler bridge):
+//   0x36 ParamChanged         sidecar -> host ASYNC (u8 slot + u32 paramId
+//                              + double normalizedValue [13 bytes total]).
+//                              Fires on every IComponentHandler::performEdit
+//                              from the plugin's editor or its internal
+//                              automation. Lets the host keep ChainSlot
+//                              .Parameters in sync so LiteDB persists
+//                              edit-driven changes.
 
 #pragma once
 
@@ -77,6 +86,7 @@ enum class ControlMessageTag : std::uint8_t {
     SlotHideEditorResult    = 0x33,
     EditorClosed            = 0x34,
     EditorResized           = 0x35,
+    ParamChanged            = 0x36,
 };
 
 class ControlPipe {
@@ -96,6 +106,16 @@ public:
     bool Send(ControlMessageTag tag,
               const std::uint8_t* data,
               std::size_t size);
+
+    // Best-effort send for lossy async events (ParamChanged, EditorResized).
+    // Probes the socket's send-queue depth via SIOCOUTQ and only writes if
+    // the entire framed message fits without blocking. Returns false on
+    // overflow — caller drops the event. Use exclusively for events where
+    // latest-wins semantics are correct (slider drags, resize coalescing);
+    // sync replies must use Send so the host doesn't deadlock waiting.
+    bool TrySendNonBlocking(ControlMessageTag tag,
+                            const std::uint8_t* data,
+                            std::size_t size);
 
     // Send a LogLine message containing `text`.
     bool SendLog(const std::string& text);

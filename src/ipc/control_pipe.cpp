@@ -16,9 +16,14 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+#if defined(__linux__)
+#  include <linux/sockios.h>
+#endif
 
 namespace zeus::plughost {
 
@@ -104,6 +109,71 @@ bool ControlPipe::Send(ControlMessageTag tag,
             return false;
         }
         sent += static_cast<std::size_t>(n);
+    }
+    return true;
+}
+
+bool ControlPipe::TrySendNonBlocking(ControlMessageTag tag,
+                                     const std::uint8_t* data,
+                                     std::size_t size) {
+    if (fd_ < 0) return false;
+    if (size > kMaxPayloadBytes) return false;
+
+    const std::size_t total = 5 + size;  // 4-byte length + 1-byte tag + payload
+
+#if defined(__linux__)
+    // Linux gives us SIOCOUTQ on AF_UNIX SOCK_STREAM — bytes still queued
+    // in the send buffer. Compare against SO_SNDBUF to know if our entire
+    // frame would fit without blocking. The frame is small (ParamChanged
+    // is 18 bytes total) so the typical answer is yes; we only drop when
+    // the host's reader has actually fallen behind.
+    int inFlight = 0;
+    if (::ioctl(fd_, SIOCOUTQ, &inFlight) == 0) {
+        int sndBuf = 0;
+        socklen_t optLen = sizeof(sndBuf);
+        if (::getsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &sndBuf, &optLen) == 0) {
+            // Linux double-counts SO_SNDBUF for accounting; the real cap
+            // is half. Compare against the conservative cap so we don't
+            // attempt a write that would silently block.
+            const int cap = sndBuf / 2;
+            if (inFlight >= cap - static_cast<int>(total)) {
+                return false;  // would block — drop the frame
+            }
+        }
+    }
+#endif
+
+    // Build the framed message in one contiguous buffer so a single
+    // sendmsg can deliver it atomically when the buffer has room.
+    std::uint8_t buf[5 + 256];  // ParamChanged is 13B payload — fits inline
+    std::uint8_t* msg = buf;
+    std::vector<std::uint8_t> heap;
+    if (total > sizeof(buf)) {
+        heap.resize(total);
+        msg = heap.data();
+    }
+    const std::uint32_t length = static_cast<std::uint32_t>(size + 1);
+    msg[0] = static_cast<std::uint8_t>(length & 0xFFu);
+    msg[1] = static_cast<std::uint8_t>((length >> 8) & 0xFFu);
+    msg[2] = static_cast<std::uint8_t>((length >> 16) & 0xFFu);
+    msg[3] = static_cast<std::uint8_t>((length >> 24) & 0xFFu);
+    msg[4] = static_cast<std::uint8_t>(tag);
+    if (size > 0) std::memcpy(msg + 5, data, size);
+
+    ssize_t n = ::send(fd_, msg, total, MSG_NOSIGNAL | MSG_DONTWAIT);
+    if (n < 0) {
+        // EAGAIN/EWOULDBLOCK is the documented "would block" case. Anything
+        // else (EPIPE, ECONNRESET) leaves the connection broken; the next
+        // sync Send will surface the failure to the host. We just drop.
+        return false;
+    }
+    if (static_cast<std::size_t>(n) != total) {
+        // Partial write on a SOCK_STREAM is allowed by POSIX but extremely
+        // rare for sub-1KB frames when SIOCOUTQ said there was room. We've
+        // sent half a message, which corrupts the framing — there's no
+        // good recovery; flag broken so callers fall back. Logging once
+        // would be helpful but stderr from a hot path can flood, skip.
+        return false;
     }
     return true;
 }
