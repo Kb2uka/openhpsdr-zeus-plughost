@@ -1,90 +1,151 @@
-# openhpsdr-zeus-plughost
+# zeus-plughost
 
-Out-of-process VST3 / VST 2.4 / CLAP host sidecar for the
-[OpenHPSDR Zeus](https://github.com/brianbruff/openhpsdr-zeus) SDR client.
+> Out-of-process **VST3 / VST 2.4 / CLAP** host sidecar for the
+> [OpenHPSDR Zeus](https://github.com/brianbruff/openhpsdr-zeus) SDR client.
 
-Zeus runs on .NET 10 and uses WDSP for radio DSP. This sidecar runs as a
-separate process, lets operators splice general-purpose audio plugins into
-the TX (and eventually RX) signal chain, and never loads third-party native
-plugin code into the Zeus process — a crash in a buggy VST kills the
-sidecar instead of the radio.
+[![License: GPL v2+](https://img.shields.io/badge/license-GPL--2.0--or--later-blue.svg)](LICENSE)
+[![Status: operator-tested on Linux](https://img.shields.io/badge/linux--x86__64-operator--tested-brightgreen.svg)](#status)
+[![Status: Win/Mac WIP](https://img.shields.io/badge/win%20%2F%20mac-audio_only-orange.svg)](#status)
+[![Issue tracker](https://img.shields.io/badge/issue-brianbruff%2Fopenhpsdr--zeus%23106-informational.svg)](https://github.com/brianbruff/openhpsdr-zeus/issues/106)
+
+Zeus is a .NET 10 + WDSP HPSDR client. This sidecar runs as a separate
+process and lets ham operators splice general-purpose audio plugins —
+EQs, compressors, reverbs, multiband processors — into the **TX mic
+chain** before the modulator. A bad plugin crashes the sidecar instead
+of the radio.
+
+```mermaid
+flowchart LR
+    Mic[🎙️ Mic] --> TxIngest[TxAudioIngest<br/>48 kHz mono]
+    TxIngest -->|MOX or Monitor| Wdsp[WdspDspEngine<br/>ProcessTxBlock]
+    Wdsp -->|Seam| Net[Zeus.PluginHost<br/>.NET supervisor]
+    Net <-->|shm rings + AF_UNIX| Sidecar[(zeus-plughost<br/>this repo)]
+
+    subgraph Sidecar process
+        Sidecar --> Chain[PluginChain<br/>8 slots]
+        Chain --> S0[VST3]
+        Chain --> S1[VST 2.4]
+        Chain --> S2[CLAP]
+        Chain --> S3[...]
+        S0 -.X11.-> Editor[Native plugin<br/>editor windows]
+        S1 -.X11.-> Editor
+        S2 -.X11.-> Editor
+    end
+
+    Wdsp -->|post-plugin mic| Modulator[fexchange2 → CFC → ALC → bandpass]
+    Modulator -->|192k IQ| Radio[📡 G2 / HL2 / ANAN]
+
+    style Mic fill:#1f6feb,stroke:#58a6ff,color:#fff
+    style Radio fill:#d29922,stroke:#bb8009,color:#fff
+    style Sidecar fill:#238636,stroke:#2ea043,color:#fff
+    style Editor fill:#8957e5,stroke:#a371f7,color:#fff
+```
 
 ## Status
 
-**Linux x86_64 — operator-tested end-to-end.** VST3, Linux VST 2.4 (Vestige),
-and CLAP plugins all load + process audio + open native editor windows
-through the X11 attach path. Stereo plugins are upmixed/downmixed against
-Zeus's mono mic chain.
+| Platform        | Audio path | Editors  | Tested with                                              |
+|-----------------|:----------:|:--------:|----------------------------------------------------------|
+| Linux x86_64    |     ✅     |    ✅    | ZamGEQ31, ZamVerb, LSP Parametric EQ, MB Expander, etc.  |
+| Windows x86_64  |     ⚠️     |    ❌    | sidecar compiles; HWND attach not yet wired              |
+| macOS arm64/x64 |     ⚠️     |    ❌    | sidecar compiles; NSView attach not yet wired            |
 
-**Windows + macOS — sidecar compiles**, plugins load + process audio, but
-`SlotShowEditor` returns `platform-not-supported`. The HWND + NSView GUI
-hosts are the next work item. Operators on those platforms can drive
-plugins headlessly via the Zeus slot UI sliders today.
+**Linux x86_64** is operator-tested end-to-end: VST3, VST 2.4 (Vestige),
+and CLAP plugins all load, process audio that hits the air, and open
+their native editors via X11 attach. Stereo plugins are upmixed/downmixed
+against the mono mic chain (mono → L+R → process → mix back to mono).
 
-Tracked under https://github.com/brianbruff/openhpsdr-zeus/issues/106.
+**Windows + macOS**: sidecar will load + process audio, but
+`SlotShowEditor` returns `platform-not-supported`. Operators on those
+platforms can drive plugins headlessly via the Zeus slot UI sliders.
+HWND + NSView GUI hosts are the next work item — tracked under
+[brianbruff/openhpsdr-zeus#106](https://github.com/brianbruff/openhpsdr-zeus/issues/106).
 
-## Build (Linux)
+## Build
 
 ```bash
-git clone --recurse-submodules https://github.com/Kb2uka/openhpsdr-zeus-plughost.git
+git clone https://github.com/Kb2uka/openhpsdr-zeus-plughost.git
 cd openhpsdr-zeus-plughost
+git submodule update --init                # pulls Steinberg vst3sdk
 cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j
 ```
 
-That produces `build/zeus-plughost`. Zeus's .NET host (`Zeus.PluginHost`
-project, see `Native/SidecarLocator.cs`) finds it via, in order:
+That produces `build/zeus-plughost`. Linux additionally needs `libx11-dev`.
 
-1. `ZEUS_PLUGHOST_BIN` env var (absolute path or PATH-resolvable name)
-2. Sibling-checkout walk: `<...>/openhpsdr-zeus-plughost/build/zeus-plughost`
+### How Zeus finds the binary
+
+`Zeus.PluginHost.Native.SidecarLocator` (in the parent repo) looks in this
+order:
+
+1. `ZEUS_PLUGHOST_BIN` environment variable
+2. Sibling-checkout walk: `<parent>/openhpsdr-zeus-plughost/build/zeus-plughost`
 3. `zeus-plughost` on `PATH`
 
 For development with both repos checked out side-by-side, the sibling
 walk Just Works.
 
-## Dependencies
-
-CMake 3.25+ and a C++17 compiler. Linux additionally needs X11 (`libx11-dev`).
-
-| Component           | Source                                              | How             | License       |
-|---------------------|-----------------------------------------------------|-----------------|---------------|
-| Steinberg vst3sdk   | https://github.com/steinbergmedia/vst3sdk          | git submodule   | proprietary, free for commercial use |
-| free-audio/clap     | https://github.com/free-audio/clap (v1.2.7)        | vendored copy   | MIT           |
-| Vestige VST2 header | clean-room single header                            | vendored        | GPL v2+       |
-
-This sidecar is GPL v2+ to match Zeus.
-
-## Distribution / packaging
-
-This repo intentionally has **no release binaries** today. Two viable
-deployment paths:
-
-1. **Vendor as submodule** under `native/zeus-plughost/` in the main
-   `openhpsdr-zeus` repo. The Zeus build system invokes CMake to compile
-   it alongside `wdsp`. Installer bundles the binary per-arch.
-2. **Per-arch release binaries** here, downloaded by the .NET host on
-   first use (or by the installer at package time).
-
-Maintainer (EI6LF) decision pending. See issue
-https://github.com/brianbruff/openhpsdr-zeus/issues/106 for the latest.
-
 ## Architecture
 
-- `src/main.cpp` — sidecar entry, control-pipe protocol, audio loop.
-- `src/ipc/` — AF_UNIX control pipe + shared-memory audio rings.
-- `src/vst3/` — Steinberg VST3 plugin host + native editor window
-  infrastructure (X11 + IRunLoop + IPlugFrame).
-- `src/vst2/` — Linux VST 2.4 plugin host + IPlugView wrapper for editors.
-- `src/clap/` — CLAP plugin host + IPlugView wrapper for editors.
+| Directory      | What lives there                                                                       |
+|----------------|----------------------------------------------------------------------------------------|
+| `src/main.cpp` | Sidecar entry, control-pipe protocol, audio loop                                       |
+| `src/ipc/`     | AF_UNIX control pipe (length-prefixed frames) + lock-free shared-memory audio rings    |
+| `src/vst3/`    | Steinberg VST3 plugin host + native editor window infrastructure (X11 + IRunLoop + IPlugFrame) |
+| `src/vst2/`    | Linux VST 2.4 plugin host + `IPlugView` wrapper for editors                            |
+| `src/clap/`    | CLAP plugin host + `IPlugView` wrapper for editors                                     |
+| `src/audio/`   | Sample format + pass-through loop                                                      |
 
 The `IPlugView` wrappers for VST2 + CLAP let one editor host
-(`vst3/editor_window.cpp`) host all three formats, with an `IEditorIdlePump`
-hook for the formats that need periodic main-thread time.
+(`vst3/editor_window.cpp`) drive all three formats, with an
+`IEditorIdlePump` hook for the formats that need periodic main-thread
+time (`effEditIdle` for VST2, `on_main_thread` + timer dispatch for CLAP).
+
+## Threading model
+
+- **Audio thread** — runs `PluginChain::Process` for every block. Lock-free,
+  alloc-free, syscall-free. Reads slot state through atomics.
+- **Control thread** — handles plugin Load/Unload/SetParam, GUI Show/Hide
+  requests. Uses the AF_UNIX control pipe.
+- **GUI thread** — owns the X11 `Display*` and the `EditorWindow` map.
+  Dispatches X events, IRunLoop timers + fds, plugin idle ticks.
+- **Plugin's own threads** — many plugins spawn their own X11 thread for
+  the editor; we don't constrain that.
+
+Sliders fire `audioMasterAutomate` (VST2) / `performEdit` (VST3) /
+output events (CLAP). We forward via lossy non-blocking writes on the
+control pipe, latest-wins — so a fast slider drag never stalls the
+plugin's GUI thread on a full socket buffer.
+
+## Distribution
+
+This repo intentionally has **no release binaries** today. Three viable
+deployment paths for the parent Zeus project to ship plugin support to
+end users:
+
+1. **Submodule** this repo into `brianbruff/openhpsdr-zeus` at
+   `native/zeus-plughost/` and have CMake compile it as part of the
+   solution build. Cleanest for distribution.
+2. **Vendor** the source under `native/zeus-plughost/` (no submodule).
+3. **Per-arch release binaries** uploaded to GitHub Releases here,
+   downloaded by the Zeus host (or installer) at first use.
+
+Maintainer (EI6LF) decision pending. See
+[brianbruff/openhpsdr-zeus#106](https://github.com/brianbruff/openhpsdr-zeus/issues/106).
 
 ## Testing
 
-The .NET-side test suite in `tests/Zeus.PluginHost.Tests` (in the main Zeus
-repo) drives this binary. Set `ZEUS_PLUGHOST_BIN=/path/to/zeus-plughost`
-before running `dotnet test`. Several tests are gated on a real plugin
-binary being available — see `tests/Zeus.PluginHost.Tests/EditorWindowTests.cs`
+The .NET-side test suite in `tests/Zeus.PluginHost.Tests` (in the
+parent repo) drives this binary. Set
+`ZEUS_PLUGHOST_BIN=/path/to/zeus-plughost` before running `dotnet test`.
+Several editor / plugin-loading tests are gated on a real plugin binary
+being present — see `tests/Zeus.PluginHost.Tests/EditorWindowTests.cs`
 for the env vars they look for.
+
+## License
+
+GPL v2 or later. Full text in [LICENSE](LICENSE), third-party
+attributions in [ATTRIBUTIONS.md](ATTRIBUTIONS.md), per-file SPDX
+identifiers in every source file.
+
+Copyright © 2026 Brian Keating (EI6LF), Douglas J. Cerrato (KB2UKA),
+and contributors.

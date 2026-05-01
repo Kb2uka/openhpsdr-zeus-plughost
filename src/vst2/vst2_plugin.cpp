@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Brian Keating (EI6LF), Douglas J. Cerrato (KB2UKA), and contributors.
+// See LICENSE at the repository root for the full text.
+//
 // vst2_plugin.cpp — Linux VST 2.4 plugin host implementation.
 //
 // Drives a Linux-native VST2 plugin through the standard host lifecycle.

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Brian Keating (EI6LF), Douglas J. Cerrato (KB2UKA), and contributors.
+// See LICENSE at the repository root for the full text.
+//
 // editor_window.h — one X11 top-level window hosting one VST3 IPlugView.
 //
 // Every plugin slot that has its editor open gets one EditorWindow.

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Brian Keating (EI6LF), Douglas J. Cerrato (KB2UKA), and contributors.
+// See LICENSE at the repository root for the full text.
+//
 // shm_ring.h — SPSC lock-free shared-memory ring of fixed-size audio blocks.
 //
 // One producer thread, one consumer thread. Slot count must be a power of

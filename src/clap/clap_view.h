@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Brian Keating (EI6LF), Douglas J. Cerrato (KB2UKA), and contributors.
+// See LICENSE at the repository root for the full text.
+//
 // clap_view.h — Steinberg::IPlugView wrapper around a CLAP plugin GUI.
 //
 // CLAP plugins expose their GUI through the clap.gui extension:

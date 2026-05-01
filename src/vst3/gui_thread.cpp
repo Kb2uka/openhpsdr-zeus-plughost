@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Brian Keating (EI6LF), Douglas J. Cerrato (KB2UKA), and contributors.
+// See LICENSE at the repository root for the full text.
+//
 // gui_thread.cpp — dedicated GUI thread implementation.
 
 #include "vst3/gui_thread.h"

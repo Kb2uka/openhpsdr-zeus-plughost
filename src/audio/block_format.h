@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Brian Keating (EI6LF), Douglas J. Cerrato (KB2UKA), and contributors.
+// See LICENSE at the repository root for the full text.
+//
 // block_format.h — wire layout for the audio data plane.
 //
 // Each block in the SPSC shared-memory ring is a 64-byte cache-line header

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Brian Keating (EI6LF), Douglas J. Cerrato (KB2UKA), and contributors.
+// See LICENSE at the repository root for the full text.
+//
 // control_pipe.h — control-channel abstraction (Phase 2).
 //
 // AF_UNIX SOCK_STREAM client on the sidecar side. The host (.NET) is the

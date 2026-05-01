@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Brian Keating (EI6LF), Douglas J. Cerrato (KB2UKA), and contributors.
+// See LICENSE at the repository root for the full text.
+//
 // shm_ring.cpp — SPSC ring impl backed by POSIX shared memory.
 //
 // Phase 2: real shm_open + ftruncate + mmap. Host creates; sidecar opens.

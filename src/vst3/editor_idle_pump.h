@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Brian Keating (EI6LF), Douglas J. Cerrato (KB2UKA), and contributors.
+// See LICENSE at the repository root for the full text.
+//
 // editor_idle_pump.h — optional idle hook for non-VST3 IPlugView wrappers.
 //
 // VST3 plugins integrate with the host via IRunLoop (timers + fds), so
