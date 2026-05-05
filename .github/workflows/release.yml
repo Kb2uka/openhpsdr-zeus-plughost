@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    name: Build Linux x86_64
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libx11-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Strip binary
+        run: strip build/zeus-plughost
+
+      - name: Stage tarball contents
+        run: |
+          DIR="zeus-plughost-${GITHUB_REF_NAME}-linux-x86_64"
+          mkdir -p "dist/${DIR}"
+          cp build/zeus-plughost LICENSE ATTRIBUTIONS.md "dist/${DIR}/"
+          cat > "dist/${DIR}/INSTALL.txt" <<'EOF'
+          zeus-plughost — Linux x86_64
+          ============================
+
+          Install:
+
+              sudo install -m 755 zeus-plughost /usr/local/bin/
+
+          Then start Zeus.  Settings → TX AUDIO TOOLS → VST Host should
+          activate (Zeus's SidecarLocator finds the binary on PATH).
+
+          Alternative: set
+              ZEUS_PLUGHOST_BIN=/absolute/path/to/zeus-plughost
+          in your environment before launching Zeus.
+
+          Source, docs, issues:
+              https://github.com/Kb2uka/openhpsdr-zeus-plughost
+
+          License: GPL-2.0-or-later (see LICENSE).
+          Third-party attributions: see ATTRIBUTIONS.md.
+          EOF
+
+      - name: Pack tarball + checksum
+        working-directory: dist
+        run: |
+          DIR="zeus-plughost-${GITHUB_REF_NAME}-linux-x86_64"
+          tar czf "${DIR}.tar.gz" "${DIR}"
+          sha256sum "${DIR}.tar.gz" > "${DIR}.tar.gz.sha256"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: false
