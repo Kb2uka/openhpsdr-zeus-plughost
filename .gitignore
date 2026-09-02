@@ -38,3 +38,5 @@ Makefile
 third_party/*/build/
 third_party/*/CMakeFiles/
 third_party/*/CMakeCache.txt
+.artifacts/
+.claude/worktrees/
